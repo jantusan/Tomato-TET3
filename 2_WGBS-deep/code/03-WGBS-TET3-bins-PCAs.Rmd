@@ -1,0 +1,331 @@
+---
+title: "PCAs of mC in 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq selected plants_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+```
+
+# Load data
+
+```{r read-sample-table}
+sample_table <- read_tsv("../data/sample_table.tsv", col_types = cols()) %>% 
+  mutate(sample = fct_inorder(sample),
+         condition = fct_inorder(condition),
+         replica = as_factor(replica),
+         description = fct_inorder(description))
+```
+
+When loading data we filter chromosome 9 as there is an anomaly in the mapping (and extranuclear genomes). We also remove those bins with low coverage (< 1000 reads / 100 kbp)
+
+```{r load-bins}
+bins_long_table <- read_tsv("../data/4_methylation/tomato_tet3_selected.mC_bins.100kbp.tsv", col_types = cols()) %>% 
+  # remove ch09 with the anomaly and organelle genomes
+  filter(!(chr %in% c("SL4.0ch09", "Mt", "Pt"))) %>% 
+  # join with sample table
+  mutate(sample = toupper(sample)) %>% 
+  left_join(sample_table, by = "sample") %>% 
+  # order the samples as a factor
+  mutate(sample = factor(sample, levels = c("WT_1", "WT_2", "A4_1", "A4_2", "A17_1", "A17_2"))) %>% 
+  # remove bins with low coverage (> 1000 reads)
+  filter((reads_m + reads_n) > 1000)
+```
+
+```{r pivot-bins}
+bins_wide_table <- bins_long_table %>% 
+  pivot_wider(id_cols = chr:context, names_from = sample, values_from = mR, names_sort = TRUE)
+```
+
+```{r aesthetic-variables}
+# Aesthetics to plot the PCA and other plots
+sample_colors <- c(WT  = "grey40", A4  = "tomato2", A17 = "slateblue2")
+
+replica_colors <- c(WT_1  = "grey60", WT_2  = "grey30", 
+                    A4_1  = "tomato1", A4_2  = "tomato3", 
+                    A17_1 = "slateblue1", A17_2 = "slateblue3")
+
+replica_shapes <- c("1" = 21, "2" = 24)
+```
+
+# PCAs 
+
+```{r}
+# General function for all DNA methylation data that takes table 
+#  (with format `chr`, `start`, `end`, `context`, [samples]) 
+#  and returns a table of Principal Components 
+pca_tidy_mC <- function(mC_table, context, ntop = 5000, sampletable = NULL) {
+  ctx <- context
+  # pick the top n observations by variance
+  top_obs <- mC_table %>%
+    filter(str_detect(context, ctx)) %>% # filter by context (including C for all)
+    rowwise(chr:context) %>% # calculate the variance for each observation
+    mutate(var = var(c_across(everything()))) %>%
+    ungroup() %>%
+    slice_max(var, n = ntop) %>% # pick only the top n
+    select(-var)
+  
+  # perform a PCA on the data
+  pca <- top_obs %>%
+    select( -(chr:context) ) %>% 
+    na.omit() %>% 
+    t() %>% 
+    prcomp()
+  
+  # convert it to a table
+  pca$x %>%
+    as_tibble(rownames = "sample") %>%
+    rename_with(~ pca$sdev^2 %>%        # square the sd to get the variance
+                  divide_by(sum(.)) %>% # divide it by the sum of variances
+                  multiply_by(100) %>%  # *100 to get a percentage of variance
+                  round() %>%           # round it
+                  str_c(.x, " [", ., "%]"), # paste it to the PCx 
+                .cols = -sample) %>% # exclude the sample column 
+    {
+      if (is.null(sampletable)) .
+      else left_join(., sampletable, by = "sample")
+    }
+}
+```
+
+```{r}
+# Function to make a matrix of PCA plots
+pca_matrix = function(pctable, pcs = 1:3, title = NULL) {
+  ggplot(pctable, aes(x = .panel_x, y = .panel_y)) + 
+    theme_cowplot() +
+    theme(axis.line=element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), strip.background = element_blank(),
+          plot.title = element_text(hjust = 0.5)) +
+    scale_shape_manual(values = replica_shapes) +
+    scale_fill_manual(values = sample_colors) +
+    guides(fill = guide_legend(override.aes = list(shape = 22)), 
+           shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+    geom_mark_hull(aes(fill = condition), radius = 0.15, concavity = 1, expand = 0.1) +
+    #geom_mark_ellipse(aes(fill = condition)) +
+    geom_autodensity(aes(fill = condition), color = "black", alpha = 0.5, show.legend = FALSE) +
+    #geom_autohistogram(aes(fill = condition), color="black", size = 0.6, alpha=0.7, show.legend = FALSE) +
+    geom_point(size=2, color="black", aes(fill = condition, shape = replica)) +
+    facet_matrix(vars(pcs +1), layer.lower = c(1, 3), layer.upper = 3, layer.diag = 2) +
+    ggtitle(title)
+}
+```
+
+### CG PCA table {.tabset .tabset-pills}
+
+#### .
+
+#### show table
+
+```{r}
+pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table)
+```
+
+# Using the PCAs to remove ouliers {.tabset}
+
+We can identify outlier samples by looking at the PCAs, those samples that constitute one Principal Component on their own will probably be outliers.
+
+## All samples {.tabset .tabset-pills}
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Let's see what to write here") +
+  plot_layout(guides = 'collect')
+
+dir.create("../figures/mC_bins", showWarnings = FALSE)
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+Most of the dispersion is due to A4_1, which we already saw in the scatter plots that is a strange one
+
+### mC
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:3, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCHH")
+```
+
+
+## Removing A4_1 {.tabset .tabset-pills .active}
+
+After removing sample A4_1 
+
+```{r}
+bins_wide_table_no_A4_1 <- bins_wide_table %>%
+  select(-A4_1)
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_no_A4_1, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_no_A4_1, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_no_A4_1, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_no_A4_1, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "After removing A4_1") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-no-A4_1.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+### mC
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table_no_A4_1, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:3, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table_no_A4_1, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table_no_A4_1, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=5, fig.width=6}
+pca_tidy_mC(bins_wide_table_no_A4_1, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:3, title = "%mCHH")
+```
+
+# Correlation between PC1 and %mC {.tabset .tabset-pills}
+  
+From the PCAs there seems to be a correlation between CG methylation loss and position across the PC1. To check if it is true I compared the average methylation across the genome (mean of all 100 kbp bins) to the position across PC1 and calculate the correlation using a linear model. The Pearson correlation coefficient is 0.98, so PC1 is reflecting global CG methylation levels. I tried this for the other context and the correlation is also perfect.
+
+## CG
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [80%]`, condition, replica) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_hull(aes(fill = condition), radius = unit(5, "mm"), 
+                concavity = 9, con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, linewidth = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = replica)) +
+  ggpubr::stat_regline_equation(label.y = 79.5, label.x = -280, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 79, label.x = -280, color = "darkorchid3") +
+  scale_shape_manual(values = replica_shapes) +
+  scale_fill_manual("Line", values = sample_colors) +
+  labs(title = "Relation between global %mCG and PC1 for 100 kbp bins", y = "global %mCG",
+       subtitle = "There is a strong correlation between PC1 and %mCG",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", linewidth=1, fill=NA))
+ggsave2(filename = "../figures/mC_bins/PCA-100kb-CG-PC1-mCG-correlation.pdf", width = 7, height = 5)
+```
+
+## CHG
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table, "CHG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [85%]`, condition, replica) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_hull(aes(fill = condition), radius = unit(5, "mm"), 
+                concavity = 9, con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, linewidth = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = replica)) +
+  ggpubr::stat_regline_equation(label.y = 55, label.x = -500, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 54, label.x = -500, color = "darkorchid3") +
+  scale_shape_manual(values = replica_shapes) +
+  scale_fill_manual("Line", values = sample_colors) +
+  labs(title = "Relation between global %mCHG and PC1 for 100 kbp bins", y = "global %mCHG",
+       subtitle = "There is a strong correlation between PC1 and %mCG",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", linewidth=1, fill=NA))
+```
+
+## CHH
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table, "CHH", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [97%]`, condition, replica) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHH") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_hull(aes(fill = condition), radius = unit(5, "mm"), 
+                concavity = 9, con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, linewidth = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = replica)) +
+  ggpubr::stat_regline_equation(label.y = 12.5, label.x = -250, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 12, label.x = -250, color = "darkorchid3") +
+  scale_shape_manual(values = replica_shapes) +
+  scale_fill_manual("Line", values = sample_colors) +
+  labs(title = "Relation between global %mCHH and PC1 for 100 kbp bins", y = "global %mCHH",
+       subtitle = "There is a strong correlation between PC1 and %mCG",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", linewidth=1, fill=NA))
+```

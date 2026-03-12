@@ -1,0 +1,1099 @@
+---
+title: "DMRs with CHG using bins method"
+subtitle: "_Tomato TET3 BS-seq reanalysis_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Filtering and data writing in Mac
+
+```{r include=FALSE}
+## Mac R 
+# libraries ----
+library(plyranges)
+library(tidyverse)
+```
+
+```{r dmrs-make-tibble}
+dmrs_whole_genome <- read_rds("../data/6_dmrs-2025/dmrs_whole_genome_A4_A17_CHG_relaxed.rds")
+
+# combine into a table with all DMRs together
+tb_dmrs_unfiltered <- filter(dmrs_whole_genome[[1]][[1]], seqnames == "empty") %>% 
+  as_tibble()
+for (sample in names(dmrs_whole_genome)) {
+  for (context in c("CHG")) {
+    tb_dmrs_unfiltered <- bind_rows(
+      tb_dmrs_unfiltered,
+      dmrs_whole_genome[[sample]][[context]] %>%
+        as_tibble() %>% 
+        mutate(chr = str_remove(seqnames, "SL4.0"),
+               comparison = case_when(sample == "a4"  ~ "TET3",
+                                      sample == "a17" ~ "NTS"))
+    )
+  }
+}
+
+# Filter p-val and C count as a list of GRanges (list of lists)
+dmrs <- list(
+  a17 = map(dmrs_whole_genome$a17, ~ filter(.x, pValue < 0.01, cytosinesCount >= 4)),
+  a4  = map(dmrs_whole_genome$a4,  ~ filter(.x, pValue < 0.01, cytosinesCount >= 4))
+)
+
+# Filter p-val and C count as a table with all DMRs combined
+tb_dmrs <- tb_dmrs_unfiltered %>% 
+  filter(pValue < 0.01, cytosinesCount >= 4)
+
+# Remove DMRs on ch09, as it has some abnormalities: I DECIDED NOT TO FO THIS
+# dmrs_no_ch09 <- list(
+#  a17 = map(dmrs$a17, ~ filter(.x, !(seqnames %in% c("SL4.0ch09", "Mt", "Pt")))),  
+#  a4  = map(dmrs$a4,  ~ filter(.x, !(seqnames %in% c("SL4.0ch09", "Mt", "Pt"))))
+#)
+#save(dmrs_no_ch09, file = "../data/6_dmrs/dmrs-whole-genome-a17-a4-filtered-no-ch09.Rdata")
+
+# Save them for future use
+write_rds(dmrs, file = "../data/6_dmrs-2025/dmrs_whole_genome_A4_A17_CHG_filtered.rds")
+
+write_tsv(tb_dmrs_unfiltered, "../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG_not-filtered.tsv")
+write_tsv(tb_dmrs, "../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG_filtered.tsv")
+```
+
+Save DMRs in a more modern format
+
+```{r}
+tb_dmrs <- read_tsv("../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG-bins-combined_filtered.tsv")
+
+dmrs_list_df <- tb_dmrs %>% 
+  mutate(comparison = factor(comparison, levels = c("TET3", "NTS"))) %>% 
+  split(f = .$comparison) %>% 
+  map(~ split(.x, f = .x$context)) %>% 
+  map_depth(2, ~ split(.x, f = .x$regionType))
+
+dmrs_list_gr <- dmrs_list_df %>% 
+  map_depth(3, as_granges)
+
+dmrs_df <- dmrs_list_df %>%
+  map_depth(2, list_rbind) %>%
+  map_depth(1, list_rbind) %>%
+  map_depth(0, list_rbind) 
+  
+write_rds(dmrs_list_df, "../data/6_dmrs-2025/DMR-list_TET3_NTS_CHG-combined_dataframe.rds")
+write_rds(dmrs_list_gr, "../data/6_dmrs-2025/DMR-list_TET3_NTS_CHG-combined_GRanges.rds")
+write_tsv(dmrs_df, "../data/6_dmrs-2025/DMRs-TET3_NTS_CHG-combined_tibble.tsv")
+```
+
+## Merge data with previous DMRs
+
+```{r}
+tb_dmrs_filtered_CHG <- read_tsv("../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG_filtered.tsv", show_col_types = FALSE) 
+tb_dmrs_filtered_CG_CHH <- read_tsv("../data/6_dmrs/table-dmrs-whole-genome-a17-a4-filtered.tsv", show_col_types = FALSE) %>% 
+  filter(context %in% c("CG", "CHH")) %>% 
+  mutate(comparison = case_when(comparison == "A.T1-TET3"  ~ "TET3",
+                                comparison == "A.T1-NT" ~ "NTS") %>% 
+           factor(levels = c("TET3", "NTS")))
+
+tb_dmrs_filtered <- bind_rows(tb_dmrs_filtered_CG_CHH, tb_dmrs_filtered_CHG)
+
+write_tsv(tb_dmrs_filtered, "../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG-bins-combined_filtered.tsv")
+```
+
+Save DMRs as GFF and BED files for compatibility
+
+```{r write-DMRs-as-gff-and-bed}
+for (compared_sample in c("NTS", "TET3")) {
+  contexts <- c(CN = "C", CG = "CG", CHG = "CHG", CHH = "CHH")
+  for (context_name in names(contexts)) {
+    regiontypes <- c(all = ".*", gain = "gain", loss = "loss")
+    for (region_name in names(regiontypes)) {
+      region_value <- regiontypes[region_name]
+      context_value <- contexts[context_name]
+      
+      file_name <- str_c("../data/6_dmrs-2025/gffs/DMRs_", compared_sample, "_", context_name, "_", region_name)
+      
+      # Filter the data and convert to GRanges object
+      granges_data <- tb_dmrs_filtered %>%
+        filter(comparison == compared_sample, 
+               str_detect(context, context_value),  
+               str_detect(regionType, region_value)) %>%
+        mutate(type = "DMR", source = "Javier") %>%
+        as_granges()
+      
+      # Check if the GRanges object is non-empty before proceeding
+      if (length(granges_data) > 0) {
+        # Write to .bed and .gff3 independently
+        write_bed(granges_data, str_c(file_name, ".bed"))
+        write_gff(granges_data, str_c(file_name, ".gff3"))
+      } else {
+        message("No data for ", file_name, " - skipping write.")
+      }
+    }
+  }
+}
+```
+
+# Plots
+
+```{r mac-libraries-functions-variables, include=FALSE}
+## Mac R 
+# libraries ----
+library(plyranges)
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(scales)
+library(patchwork)
+library(ggforce)
+library(ggplotify)
+library(ComplexHeatmap)
+ht_opt$message = FALSE
+library(shadowtext)
+library(GeneOverlap)
+library(RColorBrewer)
+library(kableExtra)
+library(slider)
+library(tidyHeatmap)
+library(ggblend)
+library(ggrastr)
+```
+
+```{r aesthetic-variables}
+# they have to be in alphabetical order for tidyheatmap
+comparison_colors  <- c("NTS"  = "slateblue2", "TET3"  = "tomato2", WT  = "grey40")
+```
+
+## Column plots {.tabset}
+
+```{r}
+tb_dmrs_filtered <- read_tsv("../data/6_dmrs-2025/table-dmrs-whole-genome_A4_A17_CHG-bins-combined_filtered.tsv", show_col_types = FALSE) %>% 
+  mutate(comparison = factor(comparison, levels = c("TET3", "NTS")))
+```
+
+```{r}
+DMR_numbers <- tb_dmrs_filtered %>%
+  mutate(comparison = fct_inorder(comparison)) %>% 
+  group_by(comparison, context,  regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop") %>% 
+  dplyr::rename(kind = regionType) %>%
+  mutate(kind = factor(kind, levels = c("gain","loss")),
+         comparison = factor(comparison, levels = c("TET3", "NTS")))
+```
+
+### Numbers
+
+```{r col-plot-numbers, fig.height=5, fig.width=8}
+(ggplot(DMR_numbers %>% filter(kind == "loss"), aes(x = DMRs, y = comparison, fill = comparison, label = DMRs)) +
+  facet_grid(rows = vars(context), cols = vars(kind), switch = "y") +
+  scale_y_discrete(position = "right", limits = rev) +
+  scale_x_reverse(labels = scales::label_number(scale_cut = cut_si("")), expand = expansion(mult = c(0.05, 0))) +
+  theme(axis.text.y = element_blank()) +
+  
+  ggplot(DMR_numbers %>% filter(kind == "gain"), aes(x = DMRs, y = comparison, fill = comparison, label = DMRs)) +
+  facet_grid(rows = vars(context), cols = vars(kind)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(labels = scales::label_number(scale_cut = cut_si("")), expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.y = element_text(hjust = 0.5)) &
+  
+  geom_col() &
+  geom_text(position = position_stack(vjust = 0.5)) &
+  coord_fixed(ratio = 4000) &
+  scale_fill_manual(values = comparison_colors) &
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA))) +
+  
+  plot_annotation(title = "Differentially Methylated Regions (DMRs). NUMBER",
+                  subtitle = "CG: Noise filter method, mpd = 0.5
+CHG: Bins method, mpd = 0.5
+CHH: Bins method, mpd = 0.3") +
+  plot_layout(widths = c(1, 1.3))
+
+ggsave2("../figures/dmrs-2026-CHG-bins/colplot-DMRs-numbers.pdf", width = 8, height = 5)
+```
+
+### Length
+
+```{r col-plot-lengths, fig.height=5, fig.width=8}
+(ggplot(DMR_numbers %>% filter(kind == "loss"), aes(x = length, y = comparison, fill = comparison, label = str_c(round(length/1000, 0), " kb"))) +
+  facet_grid(rows = vars(context), cols = vars(kind), switch = "y") +
+  scale_y_discrete(position = "right", limits = rev) +
+  scale_x_reverse(labels = scales::label_number(scale_cut = cut_si("bp")), expand = expansion(mult = c(0.05, 0))) +
+  theme(axis.text.y = element_blank()) +
+  
+  ggplot(DMR_numbers %>% filter(kind == "gain"), aes(x = length, y = comparison, fill = comparison, label = str_c(round(length/1000, 0), " kb"))) +
+  facet_grid(rows = vars(context), cols = vars(kind)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(labels = scales::label_number(scale_cut = cut_si("bp")), expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.y = element_text(hjust = 0.5)) &
+  
+  geom_col() &
+  geom_text(position = position_stack(vjust = 0.5)) &
+  coord_fixed(ratio = 2.5e5) &
+  scale_fill_manual(values = comparison_colors) &
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA))) +
+  
+  plot_annotation(title = "Differentially Methylated Regions (DMRs). LENGTH",
+                  subtitle = "CG: Noise filter method, mpd = 0.5
+CHG: Bins method, mpd = 0.5
+CHH: Bins method, mpd = 0.3") +
+  plot_layout(widths = c(1.1, 1))
+
+ggsave2("../figures/dmrs-2026-CHG-bins/colplot-DMRs-length-Figure-2B.pdf", width = 8, height = 5)
+```
+
+## Volcano plots {.tabset}
+
+```{r}
+# function to display y-axis values
+reverselog_trans <- function(base = exp(1)) {
+  trans <- function(x) -log(x, base)
+  inv <- function(x) base^(-x)
+  trans_new(paste0("reverselog-", format(base)), trans, inv, 
+            log_breaks(base = base), 
+            domain = c(1e-1000, Inf))
+}
+
+# mpd thresholds
+vlines <- tibble(context = c("CG", "CHG", "CHH"),
+                 threshold = c(0.5, 0.5, 0.3))
+
+# function to plot volcano plots of DMRs
+volcano_dmrs <- function(tb_dmrs, v_lines = vlines, pval_limit = 1e-30) {
+  ggplot(tb_dmrs %>% filter(cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(comparison), rows = vars(context)) +
+  geom_vline(data = v_lines, aes(xintercept = threshold),  color = "dodgerblue3") +
+  geom_vline(data = v_lines, aes(xintercept = -threshold), color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) %>% rasterise(dpi = 600) +
+  scale_x_continuous(expand = c(0.01, 0.01), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, pval_limit),
+                     breaks = breaks_log(n = 6), expand = c(0.01, 0.01), 
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+}
+```
+
+### No zoom
+ 
+```{r fig.width=6, fig.height=7, warning=FALSE}
+volcano_dmrs(tb_dmrs_filtered, pval_limit = NA)
+```
+
+### Zoom (p-Value > 10^-100)
+ 
+```{r fig.width=6, fig.height=7, warning=FALSE}
+volcano_dmrs(tb_dmrs_filtered, pval_limit = 1e-100)
+```
+
+### Zoom (p-Value > 10^-30)
+ 
+```{r fig.width=6, fig.height=7, warning=FALSE}
+volcano_dmrs(tb_dmrs_filtered, pval_limit = 1e-30)
+
+ggsave(filename = "../figures/dmrs-2026-CHG-bins/volcano-DMRs-zoom-30-Figure-2C-.pdf", width = 6, height = 7)
+```
+
+## Heatmaps {.tabset}
+
+Prepare data
+
+```{r load-data-from-dmr-status}
+load("../data/6_dmrs-2025/dmrs_whole_genome_A4_A17_CHG_relaxed-all-samples-data.Rdata")
+```
+
+```{r dmrs-make-tibble-with-methylation}
+tb_dmrs_meth_all_samples <- dmr_status$a17$CHG %>% 
+  as_tibble() %>%
+  rename_with(~ str_remove(.x, str_c("_", "CHG"))) %>% 
+  select(-starts_with(str_c("cytosinesCount", "CHG"))) %>% 
+  filter(seqnames == "empty")
+
+for (compar in c("a17", "a4")) {
+  for (context in c("CHG")) {
+    tb_dmrs_meth_all_samples <- bind_rows(tb_dmrs_meth_all_samples,
+                                          dmr_status[[compar]][[context]] %>% 
+                                            as_tibble() %>%
+                                            rename_with(~ str_remove(.x, str_c("_", context))) %>% 
+                                            select(-starts_with(str_c("cytosinesCount", context))) %>% 
+                                            mutate(comparison = compar,
+                                                   seqnames = str_remove(seqnames, "SL4.0"),
+                                                   diff = proportion2 - proportion1))
+  }
+}
+```
+
+```{r filter-dmrs-with-methylation}
+tb_dmrs_meth_filtered <- tb_dmrs_meth_all_samples %>%
+  filter(pValue < 0.01,
+         cytosinesCount >= 4) 
+write_tsv(tb_dmrs_meth_filtered, "../data/6_dmrs-2025/table-dmrs-whole-genome-a17-a4-CHG-bins-all-samples-filtered.tsv")
+
+tb_dmrs_meth_filtered_CG_CHH <- read_tsv("../data/6_dmrs/table-dmrs-whole-genome-a17-a4-all-samples-filtered.tsv", show_col_types = FALSE)
+tb_dmrs_meth_filtered_CHG <- read_tsv("../data/6_dmrs-2025/table-dmrs-whole-genome-a17-a4-CHG-bins-all-samples-filtered.tsv", show_col_types = FALSE)
+
+tb_dmrs_meth_filtered_combined <- bind_rows(tb_dmrs_meth_filtered_CG_CHH, tb_dmrs_meth_filtered_CHG)
+write_tsv(tb_dmrs_meth_filtered_combined, "../data/6_dmrs-2025/table-dmrs-whole-genome-a17-a4-CHG-bins-combined-all-samples-filtered.tsv")
+```
+
+Load data
+
+```{r}
+tb_dmrs_meth_filtered_combined <- read_tsv("../data/6_dmrs-2025/table-dmrs-whole-genome-a17-a4-CHG-bins-combined-all-samples-filtered.tsv", show_col_types = FALSE)
+```
+
+```{r heatmap-functions}
+# color ramp from a Brewer palette
+brewer.ramp <- function(start, end, pal) {
+  palette = RColorBrewer::brewer.pal(n = RColorBrewer::brewer.pal.info[pal, "maxcolors"],  name = pal)
+  sequence = seq(start, end, (end - start)/(RColorBrewer::brewer.pal.info[pal, "maxcolors"] - 1))
+  ramp = circlize::colorRamp2(sequence, palette)
+  return(ramp)
+}
+
+# Function that takes a tibble of combined DMR comparisons and returns a long table
+filter_dmrs_and_pivot <- function(tb_dmrs, comp, ctx) {
+  tb_dmrs %>% 
+    filter(comparison == comp, 
+           context == ctx)  %>% 
+    pivot_longer(cols = starts_with("proportion_"), values_to = "methylation", names_to = "sample", 
+                 names_prefix = "proportion_", names_transform = toupper) %>% 
+    mutate(index = str_c(seqnames, ":", start, ",", end),
+           # add description
+           description = case_when(sample == "WT" ~ "WT", 
+                                   sample == "A4" ~ "TET3", 
+                                   sample == "A17" ~ "NTS") %>% 
+             fct_inorder()) %>% 
+    # scale methylation
+    group_by(index) %>% 
+    mutate(scaled = scale(methylation)) %>% 
+    ungroup()
+}
+
+#Function that takes a ComplexHeatmap list and makes it work with Patchwork syntax
+wrap_heatmap_list <- function(heatmap_list, draw = FALSE) {
+  heatmap_list %>% 
+    {if (draw) ComplexHeatmap::draw(.) else .} %>%
+    grid::grid.grabExpr() %>% 
+    patchwork::wrap_elements()
+}
+
+# Function that takes a long tibble of dmr methylation and generates a list of two heatmaps, unscaled and scaled
+heatmap_dmrs <- function(tb_dmrs_meth_long, show_legends = TRUE, title = character(0), max_n = 4000) {
+  n_dmrs = unique(tb_dmrs_meth_long$index) %>% length()
+  
+  tb_dmrs_meth_long_sample <- tb_dmrs_meth_long %>% 
+    filter(index %in% sample(unique(tb_dmrs_meth_long$index), size = max_n))
+  
+  (heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = methylation, cluster_columns = TRUE, show_row_names = FALSE,
+             palette_value = color_ramp_unscaled, name = "% mC",
+             row_title = NULL, column_title = NULL) %>% 
+     annotation_tile(description, palette = description_colors, show_annotation_name = FALSE) %>% 
+     annotation_tile(diff, palette = color_ramp_diff, annotation_name_side = "top") + 
+     heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = scaled, cluster_columns = TRUE, show_row_names = FALSE, 
+           palette_value = color_ramp_scaled, row_km = 2, name = "scaled",
+           row_title = NULL, column_title = NULL) %>% 
+     annotation_tile(description, palette = description_colors, show_annotation_name = FALSE)) %>% 
+  draw(column_title = str_c(title, " (" , n_dmrs, " DMRs)"), merge_legend = TRUE, 
+       show_heatmap_legend = show_legends, show_annotation_legend = show_legends) %>% 
+  wrap_heatmap_list(draw = FALSE)
+}
+
+heatmap_dmrs_split <- function(tb_dmrs_meth_long, show_legends = TRUE, title = character(0), max_n = 4000, 
+                         top_tile_variable = description, top_tile_colors = description_colors, subset_trick = FALSE,
+                         use_raster = TRUE) {
+  
+  n_dmrs = unique(tb_dmrs_meth_long$index) %>% length()
+  
+  if (subset_trick == TRUE) {
+    # remove some DMRs, as if not, the diff tile doesn't match the heatmap
+    tb_dmrs_meth_long <- tb_dmrs_meth_long %>% 
+      filter(seqnames %in% str_c("chr", 1:9))
+  }
+  
+  final_n_dmrs = unique(tb_dmrs_meth_long$index) %>% length()
+  if (final_n_dmrs < max_n) max_n <- final_n_dmrs
+  
+  tb_dmrs_meth_long_sample <- tb_dmrs_meth_long %>% 
+    filter(index %in% sample(unique(tb_dmrs_meth_long$index), size = max_n)) %>% 
+    group_by(regionType) %>% 
+    mutate(genotype = {{ top_tile_variable }})
+  
+  (heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = methylation, 
+           cluster_columns = TRUE, show_row_names = FALSE, use_raster = use_raster, 
+           palette_value = color_ramp_unscaled, name = "mC", palette_grouping = list(c("firebrick3", "dodgerblue3")), 
+           row_title = NULL, column_title = NULL) %>%
+      annotation_tile(genotype, palette = top_tile_colors, show_annotation_name = FALSE) %>% 
+      annotation_tile(diff, palette = color_ramp_diff, annotation_name_side = "top") + 
+      heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = scaled, 
+              cluster_columns = TRUE, show_row_names = FALSE, use_raster = use_raster, 
+              palette_value = color_ramp_scaled, row_km = 2, name = "scaled", palette_grouping = list(c("firebrick3", "dodgerblue3"), use_raster = TRUE), 
+              row_title = NULL, column_title = NULL) %>% 
+      annotation_tile(genotype, palette = top_tile_colors, show_annotation_name = FALSE)) %>% 
+    draw(column_title = str_c(title, " (" , n_dmrs, " DMRs)"), merge_legend = TRUE, 
+       show_heatmap_legend = show_legends, show_annotation_legend = show_legends) %>% 
+    wrap_heatmap_list(draw = FALSE)
+}
+
+heatmap_dmrs_split_no_scaled <- function(tb_dmrs_meth_long, show_legends = TRUE, title = character(0), max_n = 4000, 
+                         top_tile_variable = description, top_tile_colors = description_colors, subset_trick = FALSE,
+                         use_raster = FALSE) {
+  
+  n_dmrs = unique(tb_dmrs_meth_long$index) %>% length()
+  
+  if (subset_trick == TRUE) {
+    # remove some DMRs, as if not, the diff tile doesn't match the heatmap
+    tb_dmrs_meth_long <- tb_dmrs_meth_long %>% 
+      filter(seqnames %in% str_c("chr", 1:9))
+  }
+  
+  final_n_dmrs = unique(tb_dmrs_meth_long$index) %>% length()
+  if (final_n_dmrs < max_n) max_n <- final_n_dmrs
+  
+  tb_dmrs_meth_long_sample <- tb_dmrs_meth_long %>% 
+    filter(index %in% sample(unique(tb_dmrs_meth_long$index), size = max_n)) %>% 
+    group_by(regionType) %>% 
+    mutate(genotype = {{ top_tile_variable }})
+  
+  (heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = methylation, 
+           cluster_columns = TRUE, show_row_names = FALSE, use_raster = use_raster, 
+           palette_value = color_ramp_unscaled, name = "mC", palette_grouping = list(c("firebrick3", "dodgerblue3")), 
+           row_title = NULL, column_title = NULL, width = unit(3, "cm")) %>%
+      annotation_tile(genotype, palette = top_tile_colors, show_annotation_name = FALSE) %>% 
+      annotation_tile(diff, palette = color_ramp_diff, annotation_name_side = "top", size = unit(1, "cm"))) %>% # + 
+      #heatmap(tb_dmrs_meth_long_sample, .row = index, .column = description, .value = scaled, 
+      #        cluster_columns = TRUE, show_row_names = FALSE, use_raster = use_raster, 
+      #        palette_value = color_ramp_scaled, row_km = 2, name = "scaled", palette_grouping = list(c("firebrick3", "dodgerblue3"), use_raster = TRUE), 
+      #        row_title = NULL, column_title = NULL) %>% 
+      #annotation_tile(genotype, palette = top_tile_colors, show_annotation_name = FALSE)) %>% 
+    as_ComplexHeatmap() %>% 
+    draw(column_title = str_c(title, " (" , n_dmrs, " DMRs)"), merge_legend = TRUE, 
+       show_heatmap_legend = show_legends, show_annotation_legend = show_legends) %>% 
+    wrap_heatmap_list(draw = FALSE)
+}
+```
+
+```{r colors-for-heatmaps}
+color_ramp_diff  <- brewer.ramp(1, -1, "Spectral")
+color_ramp_scaled   <- brewer.ramp(2, -2, "RdBu")
+color_ramp_unscaled <- brewer.ramp(0, 1, "YlOrRd")
+description_colors <- c(WT  = "grey40", "NTS" = "slateblue2", "TET3" = "tomato2") %>% fct_inorder() # they have to be in this order, for some reason
+```
+
+### TET3
+
+```{r fig.width=12, fig.height=7}
+tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CG") %>% 
+  heatmap_dmrs_split(title = "TET3 CG", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CHG") %>% 
+  heatmap_dmrs_split(title = "TET3 CHG", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CHH") %>% 
+  heatmap_dmrs_split(title = "TET3 CHH") +
+  
+  plot_layout(nrow = 1, widths = c(4, 4, 5)) +
+  plot_annotation(title = "TET3 positive plant (TET3 vs WT)")
+
+ggsave2("../figures/dmrs-2026-CHG-bins/heatmaps-DMRs-TET3.pdf", width = 12, height = 7)
+```
+
+### NTS
+
+```{r fig.width=12, fig.height=7}
+tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CG") %>% 
+  heatmap_dmrs_split(title = "NTS CG", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CHG") %>% 
+  heatmap_dmrs_split(title = "NTS CHG", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CHH") %>% 
+  heatmap_dmrs_split(title = "NTS CHH") +
+  
+  plot_layout(nrow = 1, widths = c(4, 4, 5)) +
+  plot_annotation(title = "TET3 negative plant (NTS vs WT)")
+
+ggsave2("../figures/dmrs-2026-CHG-bins/heatmaps-DMRs-NTS.pdf", width = 12, height = 7)
+```
+
+### CG
+
+```{r fig.width=6, fig.height=5}
+tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CG") %>% 
+  heatmap_dmrs_split_no_scaled(title = "TET3 CG\n", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CG") %>% 
+  heatmap_dmrs_split_no_scaled(title = "NTS CG\n") +
+
+  plot_layout(nrow = 1, widths = c(8.5, 11))
+
+ggsave2("../figures/dmrs-2026-CHG-bins/heatmaps-DMRs-CG.pdf", width = 6, height = 5)
+```
+
+### CHG
+
+```{r fig.width=6, fig.height=5}
+tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CHG") %>% 
+  heatmap_dmrs_split_no_scaled(title = "TET3 CHG\n", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CHG") %>% 
+  heatmap_dmrs_split_no_scaled(title = "NTS CHG\n") +
+
+  plot_layout(nrow = 1, widths = c(8.5, 11))
+
+ggsave2("../figures/dmrs-2026-CHG-bins/heatmaps-DMRs-CHG_Figure-2S3.pdf", width = 6, height = 5)
+```
+
+
+### CHH
+
+```{r fig.width=6, fig.height=5}
+tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a4", ctx = "CHH") %>% 
+  heatmap_dmrs_split_no_scaled(title = "TET3 CHH\n", show_legends = FALSE) +
+  
+  tb_dmrs_meth_filtered_combined %>% 
+  filter_dmrs_and_pivot(comp = "a17", ctx = "CHH") %>% 
+  heatmap_dmrs_split_no_scaled(title = "NTS CHH\n") +
+
+  plot_layout(nrow = 1, widths = c(8.5, 11))
+
+ggsave2("../figures/dmrs-2026-CHG-bins/heatmaps-DMRs-CHH.pdf", width = 6, height = 5)
+```
+
+## Genome plots DMR {.tabset}
+
+```{r genome-plots-functions}
+# Function to plot chr as facets in ggplot
+facet_chr <- function(chr = chr, rows = NULL, scales = "free_x", space = "free_x", breaks = 40e6, switch = NULL) {
+  list(facet_grid(rows = vars({{ rows }}), cols = vars({{ chr }}), scales = scales, space = space, switch = switch),
+       scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(breaks), 
+                          labels = label_number(scale_cut = cut_short_scale())),
+       xlab("Genomic coordinates (bp)"))
+}
+
+## Data and Function to create heterochromatin ribbon
+heterochromatin_H3K27ac = read_tsv("/path/to/genome/SL4.0_heterochromatin_H3K27ac_chXX.bed", col_names = c("chr","start","end"), col_types = cols())
+
+SL4_chrs <- str_c("ch", str_pad(c(1:8, 10:12), 2, pad = "0"))
+
+geom_heterochromatin <- function(hchrom = heterochromatin_H3K27ac, chr_col = chr, chrs = SL4_chrs) {
+  hchrom <- dplyr::rename(hchrom, {{ chr_col }} := chr)
+  list(geom_rect(data = hchrom %>% filter(chr %in% chrs),
+                 aes(x = NULL, y = NULL, xmin = start, xmax = end, ymin = -Inf, ymax = Inf), 
+                 inherit.aes = FALSE, color = NA, fill = "black", alpha = 0.1))
+}
+```
+
+### Distribution across genome 
+
+```{r fig.width=12, fig.height=10}
+# DMR density across the genome
+tb_dmrs_filtered %>% 
+  filter(chr %in% SL4_chrs) %>% 
+  ggplot(aes(start, color = comparison, fill = comparison)) +
+  facet_chr(chr = chr, rows = str_c(context, "\n", regionType, "\n", comparison), , scales = "free", space = "free_x") +
+  geom_heterochromatin() +
+  geom_area(aes(y = after_stat(count)), stat = "bin", alpha = 0.2, binwidth = 3e6) +
+  scale_color_manual("comparison", values = comparison_colors) +
+  scale_fill_manual("comparison", values = comparison_colors) +
+  labs(title = "DMR distibution across the genome", 
+       subtitle = "Note that different chromosomes are affected for TET3 and NTS (mainly for CG loss)",
+       y = "DMRs per 300 Mbp") +
+  theme(panel.spacing.x=unit(0.5, "lines"),
+        strip.background.y = element_rect(colour = NA, fill = "papayawhip"), strip.background.x = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5),
+        legend.position = "bottom", axis.title.x = element_blank())
+
+ggsave("../figures/dmrs-2026-CHG-bins/genome-plot-DMRs-distribution.pdf", width = 12, height = 10)
+```
+
+### Difference across genome 
+
+```{r fig.width=12, fig.height=8, warning=FALSE}
+tb_dmrs_filtered %>% 
+  filter(chr %in% SL4_chrs) %>% 
+  mutate(mC_diff = proportion2 - proportion1) %>% 
+  ggplot(aes(x = start, y = mC_diff, color = comparison, partition = comparison)) +
+  #facet_chr(chr = seqnames, rows = (context, regionType), scales = "free", space = "free_x", breaks = 20e6) +
+  facet_grid(rows = vars(context, regionType), cols = vars(chr), scales = "free", space = "free") +
+  geom_heterochromatin() +
+  #geom_point(shape = 16, size = 0.5, alpha = 0.6) |> partition(vars(description)) |> blend("multiply") +
+  #geom_point(shape = 16, size = 0.6, alpha = 0.4) * (blend("darken") + blend("multiply", alpha = 0.5)) +
+  geom_point(shape = 16, size = 0.6, alpha = 0.4) %>% rasterise(dpi = 300) * 
+     (blend("darken") + blend("multiply", alpha = 0.5)) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(20e6), 
+                     labels = label_number(scale_cut = cut_short_scale())) +
+  scale_y_continuous(expand = c(0, 0), breaks = breaks_width(0.2), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_color_manual("comparison", values = comparison_colors)  +
+  labs(title = "DMR methylation difference across the genome") +
+  xlab("Genomic coordinates (bp)") +
+  theme(panel.spacing.x=unit(0.5, "lines"),
+        strip.background.y = element_rect(colour = NA, fill = "papayawhip"), strip.background.x = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5),
+        legend.position = "bottom", axis.title.x = element_blank())
+
+ggsave("../figures/dmrs-2026-CHG-bins/genome-plot-DMRs-diff-blended-Figure-3A.pdf", width = 12, height = 8, dpi = 600, bg = "white", device = cairo_pdf)
+```
+
+## Correlation DMRs  Genes {.tabset}
+
+```{r read-genes-RDS}
+genes = readRDS("/path/to/genome/v4_Mt_Pt_TET3/ITAG4.1_gene_models_Mt_Pt_TET3-named.RDS")
+```
+
+### Scatter plot
+
+```{r fig.width=10, fig.height=10}
+# scatter plot of density
+si_number <- function(x, digits = 2) {
+  compress <- function(x, n) {
+    signif(x * 10^(-n), digits)
+  }
+  case_when(x >= 1e6   ~ paste0(compress(x, 6), "M"),
+            x >= 1000  ~ paste0(compress(x, 3), "k"),
+            x >= 1     ~ as.character(compress(x, 0)),
+            x >= 0.001 ~ paste0(compress(x, -3), "m"),
+            x >= 1e-6  ~ paste0(compress(x, -6), "u"))
+}
+
+scatter_density <- function(bin_width = 1e6) {
+  binned_genes <- genes %>%
+    as_tibble() %>%
+    group_by(seqnames, bins = cut_width(start, width = bin_width, boundary = 0)) %>%
+    summarise(n_genes = n(), .groups = "drop") %>%
+    mutate(#seqnames = str_remove(seqnames, "SL4.0"),
+           n_genes = 100 * jitter(n_genes, amount=.5) / length(genes))
+  
+  binned_dmrs <- tb_dmrs_filtered %>%
+    #filter(context != "CHG", regionType == "gain") %>% 
+    group_by(context, regionType, comparison) %>%
+    mutate(total = n()) %>% 
+    group_by(context, seqnames, regionType, comparison, bins = cut_width(start, width = bin_width, boundary = 0), total) %>%
+    summarise(dmrs = n(), .groups = "drop") %>%
+    mutate(dmrs = 100 * jitter(dmrs, amount=.5) / total)
+  
+  binned_joined <- full_join(binned_genes, binned_dmrs,  by = c("seqnames", "bins")) %>%
+    na.omit() 
+    
+  ggplot(binned_joined, aes(x = n_genes, y = dmrs)) +
+    facet_grid(cols = vars(context), rows = vars(regionType, comparison)) +
+    geom_smooth(method = "lm", se=FALSE, formula = y ~ x, linewidth = 0.5) +
+    geom_point(shape = 16, size = 1, alpha = 0.4) +
+    #geom_jitter(shape = 16, size = 1, alpha = 0.4, width = 0.00005, height = 0.0005) +
+    scale_x_continuous(name = str_c("% of genes per ", si_number(bin_width), "bp"), expand = c(0, 0), limits = c(0, NA)) +
+    scale_y_continuous(name = str_c("% of DMRs per ", si_number(bin_width), "bp"),  expand = c(0, 0), limits = c(0, 1.5)) +
+    ggpubr::stat_regline_equation(label.y = 1.35,#0.9 * max(binned_joined$dmrs), 
+                                  label.x = 0.1 * max(binned_joined$n_genes)) +
+    ggpubr::stat_cor(label.y = 1.2,#0.8 * max(binned_joined$dmrs), 
+                     label.x = 0.1 * max(binned_joined$n_genes)) +
+    theme(axis.line = element_blank(), panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+          strip.background = element_rect(fill = "papayawhip"))
+}
+
+scatter_density(2e6) +
+  ggtitle("Correlation of density of DMRs and Genes")
+ggsave(filename = "../figures/dmrs-2026-CHG-bins/correlation-DMRs-genes-scatter-2-Mbp_Figure-3S2.pdf", width = 10, height = 10)
+```
+
+### Heatmap
+
+```{r}
+# color ramp from a Brewer palette
+brewer.ramp <- function(start, end, pal) {
+  palette = RColorBrewer::brewer.pal(n = RColorBrewer::brewer.pal.info[pal, "maxcolors"],  name = pal)
+  sequence = seq(start, end, (end - start)/(RColorBrewer::brewer.pal.info[pal, "maxcolors"] - 1))
+  ramp = circlize::colorRamp2(sequence, palette)
+  return(ramp)
+}
+```
+
+```{r}
+bin_width = 2e6
+
+binned_genes <- genes %>%
+  as_tibble() %>%
+  group_by(seqnames, bins = cut_width(start, width = bin_width, boundary = 0)) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  mutate(n_genes = 100 * n_genes / length(genes))
+
+binned_dmrs <- tb_dmrs_filtered %>%
+  #filter(context != "CHG", regionType == "gain") %>% 
+  group_by(context, regionType, comparison) %>%
+  mutate(total = n()) %>% 
+  group_by(context, seqnames, regionType, comparison, bins = cut_width(start, width = bin_width, boundary = 0), total) %>%
+  summarise(dmrs = n(), .groups = "drop") %>%
+  mutate(dmrs = 100 * dmrs / total)
+  
+binned_joined <- full_join(binned_genes, binned_dmrs,  by = c("seqnames", "bins")) %>%
+  na.omit() 
+  
+# Calculate correlation coefficients for each combination
+correlation_data <- binned_joined %>%
+  group_by(context, regionType, comparison) %>%
+  #filter(n() > 10) %>% 
+  summarize(cor = cor(n_genes, dmrs, use = "complete.obs"), .groups = "drop")
+
+# Spread the data for heatmap plotting
+heatmap_data <- correlation_data %>%
+  pivot_wider(names_from = c(regionType, comparison), values_from = cor) %>% 
+  column_to_rownames("context")
+```
+
+```{r, fig.width=3.5, fig.height=3}
+library(shadowtext)
+
+mat = as.matrix(heatmap_data)
+
+# make my own heatmap function
+hms = Heatmap(mat, col =  brewer.ramp(1, -1, "RdYlBu"), name = "R ", rect_gp = gpar(col = "black", lwd = 2),
+              column_title = "R coefficient", cluster_columns = FALSE, cluster_rows = FALSE,
+              cell_fun = function(j, i, x, y, width, height, fill) {
+                #grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 13))
+                grid.shadowtext(sprintf("%.2f", mat[i, j]), x, y, gp = gpar(fontsize = 12 , col = "white"), bg.colour = "black")
+              }
+)
+
+
+# draw the heatmaps and save them
+draw(hms, column_title = gt_render("**Correlations DMRs vs genes**"))
+dev.copy2pdf(file = "../figures/dmrs-2026-CHG-bins/correlation-DMRs-genes-heatmap-2-Mbp_Figure-3B--.pdf", width = 3.5, height = 3) %>% invisible()
+```
+
+## Distance to genes distribution  {.tabset}
+
+### count & ECDF
+
+```{r fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+p0 <- tb_dmrs_filtered %>% 
+  as_granges() %>% 
+  add_nearest_distance(genes) %>% 
+  as_tibble() %>% 
+  ggplot(aes(distance, fill = context, color = context)) + 
+  facet_grid(rows = vars(regionType), cols = vars(comparison), scales = "free", space = "free") +
+  geom_vline(xintercept = 3000, color = "red3") +  
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), 
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(), )
+
+p_log <- p0 %+% 
+  transform(tb_dmrs_filtered %>% as_granges() %>% add_nearest_distance(genes) %>% as_tibble(), distance = distance + 1) + 
+  scale_x_continuous("distance to closest gene", trans = log10_trans(), breaks = breaks_log(n = 6), labels = label_number(scale_cut = cut_short_scale()))
+
+p_lin <- p0 + 
+  scale_x_continuous("distance to closest gene") + 
+  coord_cartesian(xlim = c(0, 1e4))
+
+(p_log + 
+    geom_area(aes(y = after_stat(count)), stat = "bin", alpha = 0.2, binwidth = 0.05, position = "identity") + 
+    scale_x_continuous(trans = log10_trans(), breaks = breaks_log(n = 6), labels = label_number(scale_cut = cut_short_scale()), limits = c(2, NA))) +
+  
+  (p_lin + 
+     geom_area(aes(y = after_stat(count)), stat = "bin", alpha = 0.2, binwidth = 50, position = "identity") + 
+     scale_x_continuous(limits = c(1, 1e4))) +
+  
+  (p_log + 
+     stat_ecdf(pad = FALSE) + 
+     scale_y_continuous("cumulative DMRs", labels = label_percent())) +
+  
+  (p_lin + 
+     stat_ecdf(pad = FALSE) + 
+     scale_y_continuous("cumulative DMRs", labels = label_percent())) +
+  
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+
+ggsave("../figures/dmrs-2026-CHG-bins/distribution-gene-distance-to-dmrs.pdf", width = 10, height = 8)
+```
+
+### Freqpoly for figure
+
+```{r fig.width=5.5, fig.height=5, warning=FALSE}
+tb_dmrs_filtered %>% 
+  #mutate(seqnames = str_c("SL4.0", seqnames)) %>% 
+  group_by(context, regionType, comparison) %>%
+  filter(n() > 10) %>% 
+  ungroup() %>% 
+  as_granges() %>% 
+  add_nearest_distance(genes) %>% 
+  mutate(distance = distance + 1) %>% 
+  as_tibble() %>%
+  ggplot(aes(distance, fill = context, color = context)) +
+  facet_grid(rows = vars(regionType), cols = vars(comparison), scales = "free", space = "free") + # cols = vars(context), 
+  geom_area(aes(y = after_stat(density)), stat = "bin", alpha = 0.2, binwidth = 0.05, position = "identity") +
+  #geom_density(adjust = 0.5, alpha = 0.3) +
+  #geom_freqpoly(binwidth = 0.05) +
+  scale_x_continuous("distance to closest gene", trans = log10_trans(), breaks = breaks_log(n = 6), labels = label_number(scale_cut = cut_short_scale()),
+                     limits = c(2, NA)) +
+  theme_cowplot() +
+  labs(title = "Distance to nearest gene from DMRs", 
+       subtitle = "Loss CG & CHG DMRs are farther from genes") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), panel.border = element_rect(colour = "black", linewidth = 1), 
+        axis.line = element_blank(), legend.position = "bottom")
+
+ggsave("../figures/dmrs-2026-CHG-bins/distribution-gene-distance-to-dmrs-density_Figure-3S2.pdf", width = 5.5, height = 5)
+```
+
+
+## Metagene plot of DMR location
+
+```{r}
+source("/path/to/project/bin/R/enriched_heatmaps_functions.R")
+```
+
+```{r}
+test <- tb_dmrs_filtered %>% 
+  filter(comparison == "NTS", 
+         context == "CHG", 
+         regionType == "loss") %>% 
+  as_granges() %>% 
+  filter_by_overlaps(genes, maxgap = 2000)
+```
+
+```{r}
+meta_tb <- tibble()
+for (comp in c("TET3", "NTS")) {
+  for (ctx in c("CG", "CHG", "CHH")) {
+    for (kind in c("gain", "loss")) {
+      dmrs <- read_gff3(str_c("../data/6_dmrs-2025/gffs/DMRs_", comp, "_", ctx, "_", kind, ".gff3"))
+      
+      mat <- normalise_to_matrix(signal = dmrs, target = filter_by_overlaps(genes, dmrs, maxgap = 2000), 
+                                 bed = TRUE, target_ratio = 1/3) 
+      meta_tb <- mat[] %>% 
+        as_tibble() %>% 
+        replace(is.na(.), 0) %>%
+        pivot_longer(everything(), names_to = "position", values_to = "value") %>%
+        mutate(position = factor(position, levels = unique(position))) %>%
+        group_by(position) %>%
+        summarise(mean   =   mean(value, na.rm = T), .groups = "drop") %>%
+        mutate(r_mean   = slide_dbl(mean,   ~mean(.x,   na.rm = TRUE), .before = 2, .after = 2), 
+               comparison = comp, 
+               context = ctx, 
+               kind = kind) %>% 
+        bind_rows(meta_tb)
+      
+      
+    }
+  }
+}
+```
+
+```{r fig.width=7, fig.height=5}
+sample_colors <- c(WT  = "grey40", TET3 = "tomato2", NTS = "slateblue2")
+
+ggplot(meta_tb, aes(x = position, y = mean, color = comparison, linetype = kind, group = paste(comparison, kind))) +
+  facet_grid(rows = vars(context), scales = "free_y") +
+  #geom_point(pch=16, size=1, alpha = 0.6) +
+  geom_line(mapping = aes(y = r_mean), linewidth = 0.5, alpha=1) +
+  scale_x_discrete(breaks = c("u1","t1","d1","d50"), labels = c(paste0("-",2," Kb"), "Start", "End", paste0("+",2," Kb"))) +
+  scale_y_continuous("genes with DMRs", labels = scales::label_percent(), limits = c(0, NA)) +
+  scale_color_manual(values = sample_colors) +
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf, linewidth = 1) + # y axis on all facets
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf, linewidth = 1) + # y axis on all facets
+  annotate("rect", xmin="t1", xmax="d1", ymin=-Inf, ymax=Inf, alpha=0.1, fill="black") +
+  theme(axis.line=element_blank(), axis.title.x = element_blank(),
+        strip.background.y = element_rect(colour = NA, fill = "papayawhip"), strip.background.x = element_blank(),
+        panel.spacing=unit(2, "lines"), strip.background=element_blank()) +
+  labs(title = "Distribution of DMRs across genes")
+
+ggsave2("../figures/dmrs-2026-CHG-bins/metaplot-DMRs-genes_Figure-3C.pdf", width = 150, height = 150, units = "mm")
+```
+
+
+## Annotation DMRs to genes and TEs
+
+```{r annotation functions}
+read_chrom.sizes <- function(file) {
+  read_tsv(file, col_names = c("seqnames", "end"), col_types = cols()) %>%
+    mutate(start = 1) %>%
+    as_granges()
+}
+
+extract_intersect <- function(query, subject, name = deparse(substitute(subject))) {
+  # query needs to be a list of granges with an element called remainder
+  result <- query
+  
+  result[[name]] <- query$remainder %>%
+    intersect_ranges(subject) %>%
+    { if (length(.) > 0) mutate(., feature = name) else . }
+  
+  result$remainder <- query$remainder %>%
+    setdiff_ranges(subject)
+  
+  return(result)
+}
+
+annotate_features_list <- function(regions, list_of_features = tomato_v4, name = deparse(substitute(regions))) {
+  result <- list(remainder = regions)
+  # intersect hierarchically
+  for (feature in names(list_of_features)) {
+    result <- result %>%
+      extract_intersect(list_of_features[[feature]],  name = feature)
+  }
+  # summarise to table
+  result %>%
+    bind_ranges() %>%
+    group_by(feature) %>%
+    summarise(bases = sum(width)) %>%
+    as_tibble() %>%
+    mutate(fraction = 1*bases/sum(bases),
+           feature = factor(feature, levels = names(list_of_features)),
+           region = name) %>%
+    arrange(feature)
+}
+
+feature_distribution_plot <- function(annotations, x = fraction, type = deparse(substitute(x)), 
+                                      genome_name = "Tomato Genome", palette = "YlGnBu") {
+  if (type == "fraction") {
+    ggplot(annotations, aes(y = as_factor(region), x = {{ x }}, fill = as_factor(feature))) +
+      geom_col(color = "black", linewidth = 0.5) +
+      scale_fill_brewer(palette = palette, name = "Feature", direction = -1) +
+      scale_x_continuous(expand = c(0,0), labels = scales::label_percent()) +
+      scale_y_discrete(position = "right", limits = rev) +
+      theme_cowplot() +
+      theme(axis.title = element_blank(), axis.line.y  = element_blank(), axis.ticks.y = element_blank()) 
+  } else if (type == "bases") {
+    annotations %>%
+      filter(region != genome_name) %>% add_row(feature = "genes", bases = 0, fraction = 0, region = genome_name, .before = 1) %>%
+      ggplot(aes(y = as_factor(region), x = bases, fill = as_factor(feature))) +
+      geom_col(color = "black", linewidth = 0.5) + 
+      scale_fill_brewer(palette = palette, name = "Feature", direction = -1) +
+      scale_x_continuous(expand = c(0,0), labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+      scale_y_discrete(limits = rev) +
+      theme_cowplot() +
+      theme(axis.line.y  = element_blank(), axis.ticks.y = element_blank(), axis.title.y = element_blank())
+  }
+}
+```
+
+```{r read-genomic-data}
+tomato_chromosomes <- str_c("SL4.0ch", str_pad(0:12, width = 2, pad = 0))
+
+genes <- read_rds("/path/to/genome/v4_Mt_Pt_TET3/ITAG4.1_gene_models_Mt_Pt_TET3-named.RDS")
+
+repeats_light <- read_gff("/path/to/genome/ITAG4.0/TEtranscripts/solLyc_ITAG4.0_RepeatModeler_repeats_light_TE.gtf")  
+
+tomato_chrs <- read_chrom.sizes("/path/to/genome/v4_Mt_Pt_TET3/S_lycopersicum_chromosomes.4.00_Mt_Pt_TET3.chrom.sizes") %>% 
+  filter(seqnames %in% tomato_chromosomes)
+```
+
+```{r distribution-without-TEs}
+tomato_v4 <- list(
+  genes = genes,
+  up    = genes %>% flank_upstream(width = 2000),
+  down  = genes %>% flank_downstream(width = 2000),
+  intergenic = tomato_chrs 
+)
+
+annotate_features_list(regions = tomato_chrs, list_of_features = tomato_v4, name = "Tomato Genome")
+```
+
+```{r distribution-with-TEs}
+tomato_v4_repeats <- list(
+  DNA_TEs = repeats_light %>% filter(class_id == "DNA"),
+  #Helitrons_TEs = repeats_light %>% filter(class_id == "RC"),
+  #LTR_TEs = repeats_light %>% filter(class_id == "LTR"),
+  Gypsy_TEs = repeats_light %>% filter(family_id == "Gypsy"),
+  Copia_TEs = repeats_light %>% filter(family_id == "Copia"),
+  #LINE_TEs = repeats_light %>% filter(class_id == "LINE"),
+  #SINE_TEs = repeats_light %>% filter(class_id == "SINE"),
+  #Retroposon_TEs = repeats_light %>% filter(class_id == "Retroposon"),
+  #Satellite_TEs = repeats_light %>% filter(class_id == "Satellite"),
+  #Unknown_TEs = repeats_light %>% filter(class_id == "Unknown"),
+  Other_TEs = repeats_light,
+  genes = genes,
+  up    = genes %>% flank_upstream(width = 2000),
+  down  = genes %>% flank_downstream(width = 2000),
+  intergenic = tomato_chrs 
+)
+
+annotate_features_list(regions = tomato_chrs, list_of_features = tomato_v4_repeats, name = "Tomato Genome") %>% 
+  arrange(-fraction)
+```
+```{r annotate-dmrs-repeats}
+dmrs_list_gr <- read_rds("../data/6_dmrs-2025/DMR-list_TET3_NTS_CHG-combined_GRanges.rds")
+
+annotations_repeats <-  bind_rows(
+  annotate_features_list(tomato_chrs,                list_of_features = tomato_v4_repeats, name = "Tomato Genome"),
+  annotate_features_list(dmrs_list_gr$TET3$CG$gain,  list_of_features = tomato_v4_repeats, name = "CG TET3 gain"),
+  annotate_features_list(dmrs_list_gr$NTS$CG$gain,   list_of_features = tomato_v4_repeats, name = "CG NTS gain"),
+  annotate_features_list(dmrs_list_gr$TET3$CG$loss,  list_of_features = tomato_v4_repeats, name = "CG TET3 loss"),
+  annotate_features_list(dmrs_list_gr$NTS$CG$loss,   list_of_features = tomato_v4_repeats, name = "CG NTS loss"),
+  annotate_features_list(dmrs_list_gr$TET3$CHG$gain, list_of_features = tomato_v4_repeats, name = "CHG TET3 gain"),
+  annotate_features_list(dmrs_list_gr$NTS$CHG$gain,  list_of_features = tomato_v4_repeats, name = "CHG NTS gain"),
+  annotate_features_list(dmrs_list_gr$TET3$CHG$loss, list_of_features = tomato_v4_repeats, name = "CHG TET3 loss"),
+  annotate_features_list(dmrs_list_gr$NTS$CHG$loss,  list_of_features = tomato_v4_repeats, name = "CHG NTS loss"),
+  annotate_features_list(dmrs_list_gr$TET3$CHH$gain, list_of_features = tomato_v4_repeats, name = "CHH TET3 gain"),
+  annotate_features_list(dmrs_list_gr$NTS$CHH$gain,  list_of_features = tomato_v4_repeats, name = "CHH NTS gain"),
+  annotate_features_list(dmrs_list_gr$TET3$CHH$loss, list_of_features = tomato_v4_repeats, name = "CHH TET3 loss"),
+  annotate_features_list(dmrs_list_gr$NTS$CHH$loss,  list_of_features = tomato_v4_repeats, name = "CHH NTS loss")
+) %>%
+  mutate(region = fct_inorder(region))
+```
+
+Near 2kb to genes
+
+```{r annotate-dmrs-2kb-repeats}
+dmrs_list_gr_near2kb <- dmrs_list_gr %>% 
+  map_depth(3, ~ .x %>% 
+              add_nearest_distance(genes) %>% 
+              subset(distance <= 2000))
+
+annotations_repeats_2kb <- bind_rows(
+  annotate_features_list(genes %>% stretch(4000),            list_of_features = tomato_v4_repeats, name = "Genes + 2kb"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CG$gain,  list_of_features = tomato_v4_repeats, name = "CG TET3 gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CG$gain,   list_of_features = tomato_v4_repeats, name = "CG NTS gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CG$loss,  list_of_features = tomato_v4_repeats, name = "CG TET3 loss"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CG$loss,   list_of_features = tomato_v4_repeats, name = "CG NTS loss"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CHG$gain, list_of_features = tomato_v4_repeats, name = "CHG TET3 gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CHG$gain,  list_of_features = tomato_v4_repeats, name = "CHG NTS gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CHG$loss, list_of_features = tomato_v4_repeats, name = "CHG TET3 loss"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CHG$loss,  list_of_features = tomato_v4_repeats, name = "CHG NTS loss"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CHH$gain, list_of_features = tomato_v4_repeats, name = "CHH TET3 gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CHH$gain,  list_of_features = tomato_v4_repeats, name = "CHH NTS gain"),
+  annotate_features_list(dmrs_list_gr_near2kb$TET3$CHH$loss, list_of_features = tomato_v4_repeats, name = "CHH TET3 loss"),
+  annotate_features_list(dmrs_list_gr_near2kb$NTS$CHH$loss,  list_of_features = tomato_v4_repeats, name = "CHH NTS loss")
+) %>%
+  mutate(region = fct_inorder(region))
+```
+
+```{r fig.width=7, fig.height=4, message=FALSE}
+(feature_distribution_plot(annotations_repeats, fraction, palette = "RdYlBu") +
+   scale_fill_manual("Feature", values = c(genes = "#225EA8", up = "#41B6C4", down = "#A1DAB4", intergenic = "grey", 
+                                           DNA_TEs = "#E31A1C", Gypsy_TEs = "#FD8D3C", Copia_TEs = "#FECC5C", Other_TEs = "#FFFFB2")) +
+   ggtitle("All DMRs") |
+   
+   feature_distribution_plot(annotations_repeats_2kb, fraction, palette = "RdYlBu") +
+   scale_fill_manual("Feature", values = c(genes = "#225EA8", up = "#41B6C4", down = "#A1DAB4", intergenic = "grey", 
+                                           DNA_TEs = "#E31A1C", Gypsy_TEs = "#FD8D3C", Copia_TEs = "#FECC5C", Other_TEs = "#FFFFB2")) +
+   ggtitle("DMRs near genes") +
+   theme(axis.text.y = element_blank())) +
+  plot_layout(guides = 'collect')
+
+ggsave2("../figures/dmrs-2026-CHG-bins/DMRs-location_Figure-3D.pdf", width = 7, height = 4)
+```

@@ -1,0 +1,443 @@
+---
+title: "DMRcaller time benchmarking"
+subtitle: "_Tomato TET3 BS-seq _"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+    toc: true
+    toc_depth: 4
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+-----------
+
+I calculated the time necessary to compute DMRs using both the Noise filter method and the Bins method of DMRcaller. I ran the computation for only the chromosome 6 of the tomato genome (the smaller, 47 Mbp), which accounts for 6 % of the length of the whole genome (783 Mbp) Assuming that the time is proportional to the lngth analysed in bp, it would take ~17 times more to compute DMRs for the whole genome compared to chromosome 6.
+
+# Noise filter method {.tabset}
+
+For the Noise filter method, there is a linear relationship between computing time and moving window size starting from 500 bp (see plot `by window size` | `linear scale ≥ 500 bp`), and for those window sizes the Minimum proportion difference doesn't affect the computing time.
+
+For smaller window sizes the connection is less clear:
+
+* For CHG (but only in sample A17) there is an inverse relation (1/x) between computing time and window size (see plot `by window size` | `log scale ≤ 100 bp`) and between computing time and minimum proportion difference (see plot `by minimum proportion difference` | `< 500 bp` **note the log scale for time**). It is intriguing that this is not seen for other contexts.
+* For CG (mostly in A17 again) there seems to be a maximum between 20 and 50 bp of window size for computing time, afetr which t decreases until reaching 500 bp. but the biggest differences here are de to minimum proportion difference, whose increase after 0.5 reduces the computing time (see plot `by minimum proportion difference` | `< 500 bp` **note the log scale for time**).
+
+```{r}
+timing_noise <- read_delim("../data/4_methylation/ch06/dmrs_ch06_a17_a4_noise_windows_timing.tsv", delim = " ", skip = 1, 
+                     col_names = c("sample", "context", "min_prop", "size", "seconds", "drop1", "drop2"), col_types = cols()) %>% 
+  select(-c(drop1, drop2)) %>% 
+  mutate(size = size %>% str_remove(":") %>% as.numeric())
+```
+
+## by window size {.tabset .tabset-pills}
+
+### log scale
+
+```{r fig.width=8, fig.height=5}
+ggplot(timing_noise, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  #geom_line(size = 2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06_test/dmrs_noise_filter/timing-DMRs-noise-size.pdf", height = 5, width = 8)
+```
+
+### linear scale ≥ 500 bp
+
+```{r fig.width=8, fig.height=5, warning=FALSE}
+ggplot(timing_noise, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  #geom_line(size = 2, alpha = 0.5) +
+  geom_smooth(method = 'lm', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  #scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  lims(x = c(500, 5000), y = c(0, 220)) +
+  #coord_cartesian(xlim = c(500, 5000), ylim = c(0, 220)) +
+  labs(title = "Time to compute DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+```
+
+### log scale ≤ 100 bp
+
+```{r fig.width=8, fig.height=5, warning=FALSE}
+ggplot(timing_noise %>% filter(size < 101), aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_line(size = 3, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #coord_cartesian(xlim = c(10, 100)) +
+  labs(title = "Time to compute DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+```
+
+## by minimun proportion difference {.tabset .tabset-pills}
+
+### all window sizes
+
+```{r fig.width=8, fig.height=5}
+ggplot(timing_noise, aes(x = min_prop, y = seconds, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+ggsave2("../figures/ch06_test/dmrs_noise_filter/timing-DMRs-noise-min-prop.pdf", height = 5, width = 8)
+```
+
+### < 500 bp
+
+```{r fig.width=8, fig.height=5}
+timing_noise %>% 
+  filter(size < 500) %>% 
+  ggplot(aes(x = min_prop, y = seconds, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+```
+
+# {.unlisted .unnumbered}
+
+```{r fig.height=7, fig.width=7, include=FALSE}
+## comparing contexts
+(timing_noise %>%
+   filter(min_prop == 0.5) %>%
+   ggplot(aes(x = size, y = seconds, color = context, fill = context)) +
+   facet_grid(cols = vars(sample)) +
+   geom_smooth(method='loess', formula= y~x) +
+   geom_point(shape = 21, size = 3, color = 1) +
+   labs(subtitle = "Minimun proportion difference set at 0.5") +
+   scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si())) /
+  (timing_noise %>%
+     filter(size == 100) %>% 
+     ggplot(aes(x = min_prop, y = seconds, color = context, fill = context)) +
+     facet_grid(cols = vars(sample)) +
+     geom_smooth(method='loess', formula= y~x) +
+     geom_point(shape = 21, size = 3, color = 1) +
+     scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2))) +
+     labs(subtitle = "Bin size set at 100 bp") +
+  plot_annotation(title = "Time to compute DMRs with Noise Filtering method") +
+  plot_layout(guides = "collect")
+```
+
+------
+
+# Bins method {.tabset}
+
+For the bins method there is also a linear relationship between computing time and Bin size (note that bin and window are different), but it is less obvious, and even at bin sizes bigger that 500 bp, low minimum proportion difference increases the computing time (see plot `by window size` | `linear scale ≥ 500 bp`).
+
+At smaller window sizes we see an interesting _ribs-like_ pattern, with times going up and then down as bin size increases. The point at which the tendency reverses depends on the minimum proportion difference, the lower the difference, the bigger the size at which time starts dropping.
+
+So in general, higher minimum proportion difference take less computing time, and bigger bins also take less computing time, up until a point (~500 bp)
+
+In any case, the computing times are probably not a limiting factor, contrary to what I expected (based on timing of DMRcaller using replicas and beta-regression statistical test).
+
+```{r}
+timing_bins <- read_delim("../data/4_methylation/ch06/dmrs_ch06_a17_a4_bins_timing.tsv", delim = " ", skip = 1, 
+                     col_names = c("sample", "context", "min_prop", "size", "seconds", "drop1", "drop2"), col_types = cols()) %>% 
+  select(-c(drop1, drop2)) %>% 
+  mutate(size = size %>% str_remove(":") %>% as.numeric())
+```
+
+## by window size {.tabset .tabset-pills}
+
+### log scale
+
+```{r fig.width=8, fig.height=5}
+ggplot(timing_bins, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Bin size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06_test/dmrs_bins/timing-DMRs-bins-size.pdf", height = 5, width = 8)
+```
+
+### linear scale ≥ 500 bp
+
+```{r fig.width=8, fig.height=5, warning=FALSE}
+ggplot(timing_bins, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_line(size = 2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  #scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  lims(x = c(500, NA)) +
+  #coord_cartesian(xlim = c(500, 5000), ylim = c(0, 220)) +
+  labs(title = "Time to compute DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+```
+
+### linear scale ≤ 200 bp
+
+```{r fig.width=8, fig.height=5, warning=FALSE}
+ggplot(timing_bins, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_line(size = 2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  #scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #lims(x = c(NA, 200)) +
+  coord_cartesian(xlim = c(NA, 200)) +
+  labs(title = "Time to compute DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+```
+
+## by minimun proportion difference {.tabset .tabset-pills}
+
+### all window sizes
+
+```{r fig.width=8, fig.height=5}
+ggplot(timing_bins, aes(x = min_prop, y = seconds, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+ggsave2("../figures/ch06_test/dmrs_bins/timing-DMRs-bins-min-prop.pdf", height = 5, width = 8)
+```
+
+### ≤ 500 bp
+
+```{r fig.width=8, fig.height=5}
+timing_bins %>% 
+  filter(size < 500) %>% 
+  ggplot(aes(x = min_prop, y = seconds, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+```
+
+# Replicas (bin method) {.tabset}
+
+Some time ago I also computed DMRs using the replicas (without merging them). This method uses a beta regression method 
+
+For the bins method there is also a linear relationship between computing time and Bin size (note that bin and window are different), but it is less obvious, and even at bin sizes bigger that 500 bp, low minimum proportion difference increases the computing time (see plot `by window size` | `linear scale ≥ 500 bp`).
+
+At smaller window sizes we see an interesting _ribs-like_ pattern, with times going up and then down as bin size increases. The point at which the tendency reverses depends on the minimum proportion difference, the lower the difference, the bigger the size at which time starts dropping.
+
+So in general, higher minimum proportion difference take less computing time, and bigger bins also take less computing time, up until a point (~500 bp)
+
+In any case, the computing times are probably not a limiting factor, contrary to what I expected (based on timing of DMRcaller using replicas and beta-regression statistical test).
+
+
+```{r}
+timing_replicas <- read_delim("../data/4_methylation/ch06/dmrs_ch06_a17_replicas_minprop_timing.tsv", delim = " ", skip = 1, 
+                     col_names = c("context", "min_prop", "seconds", "drop1", "drop2"), col_types = cols()) %>% 
+  select(-c(drop1, drop2)) %>% 
+  mutate(min_prop = min_prop %>% str_remove(":") %>% as.numeric())
+```
+
+```{r fig.width=5, fig.height=4}
+ggplot(timing_replicas, aes(x = min_prop, y = seconds, color = context, fill = context, group = context)) +
+  #geom_line(size = 2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x, alpha = 0.3) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.1)) +
+  scale_y_continuous(trans = log2_trans(), 
+                     breaks = c(10, 30 ,60, 180, 600, 1800, 3600, 10800, 21600, 43200, 86400),
+                     labels = c("10 s", "30 s", "1 min", "3 min", "10 min", "30 min", "1 h", "3 h", "6 h", "12 h", "1 d")) +
+  #scale_y_continuous(breaks = c(1, 3600, 21600, 43200, 64800, 86400, 108000),
+  #                  labels = c("1 s", "1 h", "6 h", "12 h", "18 h", "1 d", "1 d 6 h")) +
+  #  coord_cartesian(ylim = c(0, NA)) +
+  labs(title = "Time to compute DMRs\nwith replicas (Bins method)",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference", y = "Time")
+ggsave2("../figures/ch06_test/dmrs_replicas_bin/timing-DMRs-replicas.pdf", height = 4, width = 5)
+```
+
+
+# Neighbourhood method {.tabset}
+
+Using the Neighborhood method, the time to compute DMRs seems to be independent of the Size of DMR (in this case set as the minimum size to be kept as DMR), expect for the A17 CG DMRs with gap to merge DMRs set as twice the size of the mimmum size, in which case the relationship is linear. 
+
+This method seems to be the fastest, taking less than 10 seconds in to compute DMCs (size = 1, gap = 0) for CG or CHG. for CHH is slightly slower, 30 to 70 seconds, probably because of the higher number of Cs in that context. for CHH se also see that the minimum proportion difference affects the time, with intermidiates values resulting in slower runs.
+
+```{r}
+timing_neighborhod <- read_delim("../data/4_methylation/ch06/dmrs_ch06_a17_a4_neighbourhood_timing.tsv", delim = " ", skip = 1, 
+                     col_names = c("sample", "context", "min_prop", "size", "gap", "seconds", "drop1", "drop2"), col_types = cols()) %>% 
+  select(-c(drop1, drop2)) %>% 
+  mutate(gap = gap %>% str_remove(":"))
+```
+
+## by window size {.tabset .tabset-pills}
+
+### log scale
+
+```{r fig.width=8, fig.height=10}
+ggplot(timing_neighborhod, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample, gap), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  #geom_line(size = 2, alpha = 0.5) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Neighborhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimum DMR size",
+       caption = "0, 200 & 2x represent minimum gap to merge DMRs (x = size)") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06_test/dmrs_neighborhood/timing-DMRs-neighborhood-size.pdf", height = 10, width = 8)
+```
+
+### linear scale
+
+```{r fig.width=8, fig.height=10, warning=FALSE}
+ggplot(timing_neighborhod, aes(x = size, y = seconds, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(sample, gap), scales = "free", space = "free") +
+  geom_line(size = 2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  #scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  #scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Neighborhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size",
+       caption = "0, 200 & 2x represent minimum gap to merge DMRs (x = size)") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank()) 
+```
+
+## by minimun proportion difference {.tabset .tabset-pills}
+
+### all window sizes
+
+```{r fig.width=8, fig.height=10}
+ggplot(timing_neighborhod, aes(x = min_prop, y = seconds, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(sample, gap), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(1, 10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(1, 10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Neighborhod method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference",
+       caption = "0, 200 & 2x represent minimum gap to merge DMRs (x = size)") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+ggsave2("../figures/ch06_test/dmrs_neighborhood/timing-DMRs-neighborhood-min-prop.pdf", height = 5, width = 8)
+```
+
+### size = 1 bp (linear scale)
+
+```{r fig.width=8, fig.height=5}
+timing_neighborhod %>% 
+  filter(size == 1) %>% 
+  ggplot(aes(x = min_prop, y = seconds, color = context, fill = context, group = context)) +
+  facet_grid(cols = vars(gap), rows = vars(sample), scales = "free", space = "free") +
+  geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  #scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Time to compute DMRs with Neighborhod method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nSize set to 1 bp", x = "Minimun proportion difference",
+       caption = "0, 200 & 2x represent minimum gap to merge DMRs (x = size)") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank())
+```
+
+# Whole genome 
+
+Computing DMRs for the whole genome after deciding on the parameters took less than 3 hours in total, with CHH taking the longest
+
+```{r}
+timing_whole_genome <- read_delim("../data/4_methylation/dmrs_whole_genome_timing.tsv", delim = " ", skip = 1, 
+                     col_names = c("sample", "context", "seconds", "drop1", "drop2"), col_types = cols()) %>% 
+  select(-c(drop1, drop2)) %>% 
+  mutate(context = context %>% str_remove(":"))
+```
+
+```{r fig.width=4, fig.height=4}
+ggplot(timing_whole_genome, aes(x = context, y = seconds/60, fill = sample, label = round(seconds/60, 0))) + 
+  geom_col(color = "black", width = 0.8, position = "dodge") + 
+  geom_shadowtext(position = position_dodge(width = 0.8), vjust = 0.5, color = "white", size = 5) +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_fill_manual(values = c(a17 = brewer.pal(11, "RdYlBu")[10], a4 = brewer.pal(11, "RdYlBu")[2])) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + 
+  labs(title = "Time to compute DMRs\nfor the whole genome", y = "minutes",
+       subtitle = "CG & CHG: Noise filter method, mpd = 0.5\nCHH: Bins method, mpd = 0.3",
+       caption = paste("Total time:", round(sum(timing_whole_genome$seconds)/60/60, 1), "hours")) +
+  theme(legend.position= "bottom", legend.justification = "center", legend.title = element_blank(),
+        strip.background = element_rect(fill = "cornsilk", color = 1, size = 1),
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())
+ggsave("../figures/dmrs/timing-DMRs-whole-genome.pdf", width=4, height=4)
+```
+
+
+
+# {.unlisted .unnumbered}
+
+***

@@ -1,0 +1,317 @@
+---
+title: "Connection TE expression and DMRs"
+subtitle: "_Tomato TET3_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r libraries-and-functions, include=FALSE}
+library(plyranges)
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(scales)
+
+library(ComplexHeatmap)
+ht_opt$message = FALSE
+library(RColorBrewer)
+library(tidyHeatmap)
+library(slider)
+
+## Function to plot chr as facets in ggplot
+facet_chr <- function(chr = seqnames, rows = NULL, scales = "free_x", space = "free_x", breaks = 40e6, switch = NULL) {
+  list(facet_grid(rows = vars({{ rows }}), cols = vars({{ chr }}), scales = scales, space = space, switch = switch),
+       scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(breaks), 
+                          labels = label_number(scale_cut = cut_short_scale())),
+       xlab("Genomic coordinates (bp)"))
+}
+```
+
+# Load data
+
+Differentially expressed TEs
+```{r}
+genes <- read_rds("/path/to/genome/v4_Mt_Pt_TET3/ITAG4.1_gene_models_Mt_Pt_TET3-named.RDS")
+
+repeats_light <- read_gff("/path/to/genome/ITAG4.0/TEtranscripts/solLyc_ITAG4.0_RepeatModeler_repeats_light_TE.gtf") %>% 
+  select(class_id, family_id, gene_id, transcript_id) %>% 
+  #mutate(class = case_when(class_id == "DNA" ~ "DNA",
+  #                         class_id == "LTR" ~ "LTR",
+  #                         .default = "Other")) 
+  mutate(TE_type = case_when(class_id == "DNA" ~ "DNA",
+                             family_id == "Gypsy" ~ "Gypsy",
+                             family_id == "Copia" ~ "Copia",
+                             class_id == "LTR" ~ "other LTR",
+                             .default = "Other") %>% 
+           factor(levels = c("DNA", "Gypsy", "Copia", "other LTR", "Other")))
+
+detes_df <- read_rds(file = "../data/6_degs/TEcounts/DEGs-p01.rds") %>% 
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison)) %>% 
+  dplyr::rename(log2FC = log2FoldChange) %>% 
+  mutate(kind = case_when(log2FC > 0 ~ "up",
+                          log2FC < 0 ~ "down")) %>% 
+  relocate(kind, .after = log2FC) %>% 
+  filter(element == "TE")
+
+dmrs_list_deep_df <- read_rds("../../bsseq_selected/data/6_dmrs/DMR-list_TET3-NTS_dataframe.rds")
+
+dmrs_list_gr <- read_rds("../../bsseq_selected/data/6_dmrs/DMR-list_TET3-NTS_GRanges.rds") %>%
+  list_flatten() %>% 
+  list_flatten()
+
+dmrs_gr <- dmrs_list_gr %>% 
+  unname() %>% # without it you cannot merge them
+  purrr::reduce(c)
+
+dmrs_2kb_list_gr <- read_rds("../../bsseq_selected/data/6_dmrs/DMRs-annotated-to-genes-2kb.RDS") %>% 
+  map(as_granges) %>% 
+  set_names(str_replace, "NT", "NTS") %>% 
+  set_names(str_remove, "A.T1-")
+
+dmrs_2kb_gr <- dmrs_2kb_list_gr %>% 
+  unname() %>% # without it you cannot merge them
+  purrr::reduce(c)
+
+```
+
+## get DETEs location in the genome
+
+```{r}
+dete_locations <- repeats_light %>% 
+  as_tibble() %>% 
+  mutate(id = str_c(gene_id, family_id, class_id, sep = ":")) %>% 
+  inner_join(detes_df, by = join_by("id" == "id"))
+
+dete_locations_gr <- dete_locations %>% 
+  as_granges()
+
+write_bed(x = dete_locations_gr, file = "../data/4_counts/TEcounts/DETE-locations.bed")
+```
+
+```{r}
+full_join(
+  detes_df       %>% dplyr::count(comparison, kind),
+  dete_locations %>% dplyr::count(comparison, kind),
+  by = c("comparison", "kind"), suffix = c("_families", "_elements")
+) %>% 
+  mutate(ratio = n_elements / n_families)
+```
+
+```{r}
+dete_locations %>% 
+  group_by(comparison, kind, id, TE_type) %>% 
+  summarise(n = n(), .groups = "drop") %>% 
+  ggplot(aes(x = kind, y = n, fill = kind)) +
+  facet_grid(cols = vars(comparison)) +
+  geom_boxplot(alpha = 0.5, width = 0.7) +
+  geom_sina(aes(shape = TE_type, group = kind), alpha = 0.6, size = 2) +
+  scale_fill_brewer( palette = "Set1", direction = -1) +
+  scale_shape_manual(values = c(22, 24, 25, 23, 21)) +
+  scale_y_log10("Copies per TE") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), #legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+
+dir.create("../figures/TE-expression-correlations", showWarnings = FALSE)
+ggsave2("../figures/TE-expression-correlations/boxplot-copies-per-family-DETEs-.pdf", width = 150, height = 100, units = "mm")
+```
+
+
+```{r fig.width=12, fig.height=5}
+dete_locations %>% 
+  filter(seqnames != "SL4.0ch00",
+         comparison != "NTS_vs_TET3") %>% 
+  mutate(rows = paste(comparison, kind, sep = "\n")) %>% 
+ggplot(aes(x = start, fill = kind)) +
+  facet_chr(rows = rows, scales = "free") +
+  #geom_area(aes(y = ..count../max(count)), stat = "bin", position = "identity", binwidth = 2e6, color = "black", alpha = 0.5) +
+  stat_bin(geom = "area", binwidth = 2e6, color = "black",alpha = 0.5, position = "identity") +
+  scale_fill_brewer( palette = "Set1", direction = -1) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), #legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+
+ggsave2("../figures/TE-expression-correlations/genome-plot-DETE-distribution.pdf", width = 500, height = 150, units = "mm")
+```
+
+```{r fig.width=12, fig.height=5}
+repeats_light %>% 
+  as_tibble() %>% 
+  filter(seqnames != "SL4.0ch00") %>% 
+  ggplot(aes(x = start, fill = TE_type)) +
+  facet_chr(rows = TE_type, scales = "free") +
+  #geom_area(aes(y = ..count../max(count)), stat = "bin", position = "identity", binwidth = 2e6, color = "black", alpha = 0.5) +
+  stat_bin(geom = "area", binwidth = 2e6, color = "black",alpha = 0.5, position = "identity") +
+  scale_fill_brewer( palette = "Set1", direction = -1) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+
+ggsave2("../figures/TE-expression-correlations/genome-plot-all-TEs-distribution.pdf", width = 500, height = 150, units = "mm")
+```
+
+```{r fig.width=15, fig.height=6}
+# Function to compute sliding function at the middle point of a window
+slide_dbl_midwindow <- function(.x, .f, window = 100, ...) {
+  slide_dbl(.x, ~.f(.x, na.rm = T), ...,  
+            .before = ceiling(window / 2) - 1, # to account for the middle point 
+            .after = floor(window / 2))        # otherwise the real window size would be window + 1
+}
+
+
+fc <- dete_locations %>% 
+  filter(seqnames != "SL4.0ch00",
+         comparison != "NTS_vs_TET3") %>%
+  arrange(seqnames, comparison, kind, start) %>%  # Ensure proper order for sliding functions
+  group_by(seqnames, comparison, kind) %>%
+  mutate(sliding_mean = slide_dbl_midwindow(WT_1, mean, window = 100)) %>%
+  ungroup()
+
+ggplot(fc, aes(x = start / 1e+6, y = WT_1, color = comparison)) +
+  facet_grid(cols = vars(seqnames), rows = vars(kind), scales = "free_x", space = "free_x", switch = "y") +
+  geom_point(alpha = 0.2, size = 0.5, shape = 16, position = position_jitternormal(sd_x = 0, sd_y = 0.2)) +
+  geom_line(data = fc %>% filter(kind == "up"), 
+            aes(y = sliding_mean, group = paste(comparison, kind)), size = 0.7) +
+  geom_line(data = fc %>% filter(kind == "down"), 
+            aes(y = sliding_mean, group = paste(comparison, kind)), size = 0.7) +
+  #geom_vline(data = centromeres, aes(xintercept = position / 1e+6), linetype = "dashed", color = "black") +
+  #geom_rect(data = heterochromatin, aes(xmin = start / 1e+6, xmax = end / 1e+6, ymin = -Inf, ymax = Inf, y = NULL),
+  #          color = NA, fill = "black", alpha = 0.1) +
+  #geom_rect(data = heterochromatin, aes(xmin = start / 1e+6, xmax = end / 1e+6, ymin = -Inf, ymax = -6, y = NULL),
+  #          color = NA, fill = "black", alpha = 1) +
+  scale_color_manual(values = c("TET3_vs_WT"  = "tomato2", "NTS_vs_WT" = "slateblue2")) +
+  #scale_fill_manual(values  = c("TET3_vs_WT"  = "tomato2", "NTS_vs_WT" = "slateblue2")) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = seq(0, 300, 10)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(NA, NA)) +
+  labs(title = "TE expression across the genome",
+       x = "Position across the genome (Mbp)",
+       y = "WT_1 vsd counts") +
+  annotate("segment", x = -Inf, xend = Inf, y = -Inf, yend = -Inf, linewidth = 1) + # x axis on all facets
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), #legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+```
+
+# Next STEPS
+
+- connect DETEs to DMRs
+  - DETEs near DMRs, control, random TEs near DMRs (intersect) (also, using annotation plots)
+
+CG loss DMRs are closer to DETEs than CHH loss (gain are similarly close) 
+
+```{r fig.height=4, fig.width=5}
+dmrs_gr %>%
+  add_nearest_distance(dete_locations_gr) %>% 
+  as_tibble() %>% 
+  filter(context != "CHG") %>% 
+  ggplot(aes(x = distance, #after_stat(ncount), 
+             color = paste(context, regionType), fill = regionType)) +
+  facet_grid(rows = vars(comparison), scale = "free_y") +
+  stat_ecdf() +
+  #stat_bin(geom = "area", bins = 100, alpha = 0.23, position = "identity") +
+  #geom_density() +
+  scale_x_continuous(transform = "log1p", breaks = breaks_log(), labels = label_number(), limits = c(100, 120000)) +
+  #scale_x_continuous(limits = c(10, 100000)) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "distance DMRs to DETEs",
+       subtitle = "CG loss are closer than the rest") +
+  scale_color_brewer("DMRs", palette = "Set1", direction = -1) +
+  #scale_fill_brewer(palette = "Set1", direction = -1) +
+  theme(panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank()) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"))#, legend.position= "none")
+```
+
+# 
+
+```{r fig.height = 4, fig.width=4}
+bind_rows(
+  dmrs_gr %>%
+    filter_by_overlaps(dete_locations_gr, maxgap = 00) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "Yes"),
+  dmrs_gr %>%
+    filter_by_non_overlaps(dete_locations_gr, maxgap = 00) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "No")
+) %>% 
+  count(comparison, context, regionType, overlaps) %>% 
+  filter(context != "CHG") %>% 
+  ggplot(aes(x = n, y = paste(context, regionType, comparison), fill = overlaps)) +
+  facet_grid(rows = vars(context), scale = "free_y") +
+  geom_col(color = "black", position = "fill") +
+  scale_x_continuous(expand = c(0,0), labels = scales::label_percent()) +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Overlaps DMRs with DETEs", 
+       subtitle = "Maximum gap of 0 (real overlap)") +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  theme(axis.title = element_blank(), axis.line.y  = element_blank(), axis.ticks.y = element_blank(),
+        strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position = "bottom", 
+        plot.title.position = "plot")
+```
+
+```{r fig.height = 9, fig.width=5}
+bind_rows(
+  dete_locations_gr %>%
+    filter_by_overlaps(dmrs_gr, maxgap = 1000) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "Yes"),
+  dete_locations_gr %>%
+    filter_by_non_overlaps(dmrs_gr, maxgap = 1000) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "No")
+) %>% 
+  count(comparison, kind, TE_type, overlaps) %>% 
+  ggplot(aes(x = n, y = paste(TE_type, kind, comparison), fill = overlaps)) +
+  facet_grid(rows = vars(comparison, kind), scale = "free_y", space = "free") +
+  geom_col(color = "black", position = "fill") +
+  #geom_col(color = "black", position = "identity") +
+  #scale_x_continuous(expand = c(0,0), labels = scales::label_percent()) +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Overlaps DMRs with DETEs", 
+       subtitle = "Maximum gap of 0 (real overlap)") +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  theme(axis.title = element_blank(), axis.line.y  = element_blank(), axis.ticks.y = element_blank(),
+        strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position = "bottom", 
+        plot.title.position = "plot")
+```
+
+
+
+
+```{r fig.height = 3, fig.width=4}
+bind_rows(
+  dmrs_2kb_gr %>%
+    filter_by_overlaps(dete_locations %>% as_granges(), maxgap = 00) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "Yes"),
+  dmrs_2kb_gr %>%
+    filter_by_non_overlaps(dete_locations %>% as_granges(), maxgap = 00) %>% 
+    as_tibble() %>% 
+    mutate(overlaps = "No")
+) %>% 
+  count(comparison, context, regionType, overlaps) %>% 
+  filter(context != "CHG") %>% 
+  ggplot(aes(x = n, y = paste(context, regionType, comparison), fill = overlaps)) +
+  facet_grid(rows = vars(context), scale = "free_y") +
+  #geom_col(color = "black", position = "fill") +
+  geom_col(color = "black", position = "identity") +
+  #scale_x_continuous(expand = c(0,0), labels = scales::label_percent()) +
+  scale_y_discrete(limits = rev) +
+  labs(title = "") +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  theme(axis.title = element_blank(), axis.line.y  = element_blank(), axis.ticks.y = element_blank(),
+        strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position = "bottom")
+  
+```
+

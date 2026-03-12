@@ -1,0 +1,234 @@
+---
+title: "Mapping stats and TET3 genotyping by reads"
+subtitle: "_Tomato TET3 BS-seq screening test_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r include=FALSE}
+# Libraries
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(scales)
+```
+
+Read the bismark summary report to use it as a sample table
+
+```{r fig.height=10, fig.width=15}
+bismark_report <- read_tsv("../qa/3_mapped/bismark_summary_report.txt", col_types = cols()) %>% 
+  transmute(sample = str_remove(File, "_bismark_bt2.bam"),
+            raw_reads = `Total Reads`,
+            mapped_reads = `Aligned Reads`,
+            mapping_rate = mapped_reads / raw_reads,
+            unmapped_reads = `Unaligned Reads`,
+            ambiguous_reads = `Ambiguously Aligned Reads`,
+            dedup_reads = `Unique Reads (remaining)`,
+            dup_rate = `Duplicate Reads (removed)` / dedup_reads,
+            cytosines = `Total Cs`,
+            meth_CG = `Methylated CpGs`,
+            unmeth_CG = `Unmethylated CpGs`,
+            mCG = 100 * meth_CG / meth_CG + unmeth_CG,
+            meth_CHG = `Methylated chgs`,
+            unmeth_CHG = `Unmethylated chgs`,
+            mCHG = 100 * meth_CHG / meth_CHG + unmeth_CHG,
+            meth_CHH = `Methylated CHHs`,
+            unmeth_CHH = `Unmethylated CHHs`,
+            mCHH = 100 * meth_CHH / meth_CHH + unmeth_CHH) %>% 
+  # filter out the controls and samples with almost no reads
+  filter( ! sample %in% c("A1_2", "B2_13", "neg","PBS", "Undetermined")) %>% 
+  # set order for the sampes
+  mutate(sample = factor(sample, levels = c(
+    "WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+    "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+    "A1_4", "A1_6", "A1_7", "A1_8", 
+    "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+    "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+    "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+    "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20"
+  ))) %>% 
+  arrange(sample)
+```
+
+```{r}
+(sample_table <- bismark_report %>% 
+  select(sample, raw_reads, dedup_reads, cytosines) %>%
+  mutate(condition = str_remove(sample, "_.*") %>% factor(levels = c("WT", "A", "A1", "A11", "B", "B1", "B2")),
+         line = str_remove_all(condition, "[:digit:]*") %>% factor(levels = c("WT", "A", "B")),
+         replica = str_remove(sample, ".*_") %>% as_factor(),
+         description = case_when(condition == "WT" ~ "Control",
+                                 condition == "A" ~ "A T1",
+                                 condition == "A1" ~ "A T2",
+                                 condition == "A11" ~ "A T3",
+                                 condition == "B" ~ "B T1",
+                                 condition == "B1" ~ "B T2-",
+                                 condition == "B2" ~ "B T2+") %>% 
+           fct_inorder()) %>%
+  arrange(condition, replica))
+```
+
+```{r aesthetic-variables}
+# Aesthetics to plot the PCA and other plots
+subline_colors <- c(A   = RColorBrewer::brewer.pal(8, "Reds")[4], 
+                    A1  = RColorBrewer::brewer.pal(8, "Reds")[6],
+                    A11 = RColorBrewer::brewer.pal(8, "Reds")[8], 
+                    B   = RColorBrewer::brewer.pal(8, "Blues")[4], 
+                    B1  = RColorBrewer::brewer.pal(8, "Blues")[6], 
+                    B2  = RColorBrewer::brewer.pal(8, "Blues")[8], 
+                    WT  = RColorBrewer::brewer.pal(8, "Greys")[8])
+
+line_shapes <- c(WT = 21, A = 23, B = 24)
+genotype_shape <- c("TET3" = 24, "NT" = 21) 
+```
+
+Previously I had used the threshold of 15 Million Cs covered to discard some samples and make the PCAs of 100 kbp bins less noisy. After having another go at the PCAs I think it is better to use **14 Million Cs**. This way I keep more 2 more samples for the analysis and they don't seem to be outliers.
+
+```{r fig.width=8, fig.height=3}
+bismark_report %>% 
+  left_join(sample_table, by = c("sample", "raw_reads", "dedup_reads", "cytosines")) %>% 
+  ggplot(aes(sample, cytosines, fill = condition)) +
+  facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+  geom_col(alpha = 0.8, width = 0.5, color = "black") + 
+  geom_point(aes(color = cytosines > 14e6), shape = 18, size = 4) +
+  geom_hline(yintercept = 14e6, linetype = "dashed") +
+  scale_fill_manual(values = subline_colors) +
+  scale_color_manual(values = (c("red2", "grey20"))) +
+  scale_y_continuous(expand = expansion(c(0, 0.1)), labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Cytosines covered by BS-seq", 
+       subtitle = "We discarded samples with less than 14 Million Cytosines covered",
+       y = "Covered Cs") +
+  theme(legend.position = "none", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+
+ggsave("../qa/covered-cytosines.pdf", width=8, height=3)
+```
+
+## Determine TET3 genotype from mapped reads {.tabset}
+
+I will use the number of mapped reads as an indication if a plant is carying the TET3 transgene or not. This information is summarised in the samtools idxstats output
+
+```{r}
+idxstats <- read_tsv("../qa/3_mapped/03_mapped_samtools_multiqc_data/multiqc_samtools_idxstats.txt", col_types = cols()) %>% 
+  select(-`*`) %>% 
+  dplyr::rename(sample = Sample) %>% 
+  pivot_longer(SL4.0ch00:last_col(), names_to = "chr", values_to = "reads") %>% 
+  separate(reads, c(NA, "reads", "chr_length", NA), convert = TRUE) %>% 
+  group_by(sample) %>% 
+  mutate(reads = replace_na(reads, 0),
+         total_reads = sum(reads, na.rm = TRUE),
+         reads_per_million = 1e6 * reads / total_reads,
+         reads_per_million_per_megabase = 1e6 * reads_per_million / chr_length) %>%
+  # filter controls and samples with almost no reads
+  filter( ! sample %in% c("A1_2", "B2_13", "neg","PBS", "Undetermined")) %>% 
+  mutate(sample = factor(sample, levels = c(
+    "WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+    "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+    "A1_4", "A1_6", "A1_7", "A1_8", 
+    "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+    "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+    "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+    "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20"
+  ))) %>%
+  left_join(sample_table, by = "sample")
+
+# filter samples with less than 14 Million mapped reads
+idxstats_filtered <- idxstats %>% 
+  filter(cytosines > 14e6) # c("B2_18", "B2_20", "B_6", "B_11", "WT_6", "B_5", "A_1", "A_12", "B1_2", "B2_14")) #, "B1_7", "B2_16"))
+```
+
+### Chr9 anomaly
+
+```{r fig.height=4, fig.width=6}
+ggplot(idxstats_filtered, aes(chr, reads_per_million_per_megabase, color = condition, group = sample)) +
+  geom_hline(yintercept = 1350, linetype = "dashed") +
+  geom_jitter() +
+  scale_color_manual(values = subline_colors) +
+  labs(title = "normalised reads mapped to each chromosome", 
+       subtitle = "normalised both for library size and chromosome size",
+       y = "reads per million per Mbp",
+       caption = "Note the drop in all samples for chr 9") +
+  theme(strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0), axis.title.x = element_blank())
+ggsave("../qa/chr9-anomaly.pdf", width = 6, height = 4)
+```
+
+### All plants {}
+
+```{r fig.width=9, fig.height=3}
+# TDNA_TET3_v2.1
+ggplot(idxstats %>% filter(chr == "TDNA_TET3_v2.1"), aes(sample, reads, fill = condition)) +
+  facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+  geom_hline(yintercept = 10, linetype = "dashed") +
+  geom_col(alpha = 0.8, width = 0.5, color = "black") +
+  geom_point(aes(shape = reads > 10), color = "black", size = 3) +
+  scale_shape_manual(values = c(21, 24 )) +
+  scale_fill_manual(values = subline_colors) +
+  labs(title = "Genotyping TET3 plants", 
+       subtitle = "using reads mapped uniquely to TET3 T-DNA",
+       y = "reads per million",
+       caption = "samples with more than 10 reads per million are considered TET3+") +
+  theme(legend.position = "none", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0), axis.title.x = element_blank())
+
+ggsave("../figures/genotyping-TET3-all.pdf", width = 9, height = 3)
+```
+
+### samples with > 14M Cs {.active}
+
+```{r fig.width=8, fig.height=3}
+# TDNA_TET3_v2.1
+ggplot(idxstats_filtered %>% filter(chr == "TDNA_TET3_v2.1"), aes(sample, reads, fill = condition)) +
+  facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+  geom_hline(yintercept = 10, linetype = "dashed") +
+  geom_col(alpha = 0.8, width = 0.5, color = "black") +
+  geom_point(aes(shape = reads > 10), color = "black", size = 3) +
+  scale_shape_manual(values = c(21, 24)) +
+  scale_fill_manual(values = subline_colors) +
+  labs(title = "Genotyping TET3 plants", 
+       subtitle = "using reads mapped uniquely to TET3 T-DNA",
+       y = "reads per million",
+       caption = "samples with more than 10 reads per million are considered TET3+") +
+  theme(legend.position = "none", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0), axis.title.x = element_blank())
+
+ggsave("../figures/genotyping-TET3.pdf", width = 8, height = 3)
+```
+
+## Write sample table for future use
+
+Define transgenic plants and write to table
+
+```{r}
+(genotype_table <- idxstats %>% 
+  arrange(sample) %>% 
+  filter(chr == "TDNA_TET3_v2.1") %>% 
+  select(sample, TET3_reads = reads, total_reads_idxstats = total_reads, TET3_reads_per_million = reads_per_million) %>% 
+  mutate(TET3_reads_per_million = round(TET3_reads_per_million, 2),
+         genotype = case_when(TET3_reads_per_million > 10 ~ "TET3",
+                              TET3_reads_per_million < 10 ~ "NT")))
+
+sample_table_genotype <- sample_table %>% 
+  full_join(genotype_table, by = "sample")
+
+write_csv(sample_table_genotype, "../data/tet3-bs-screen-sample-table.csv")
+```
+

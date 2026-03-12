@@ -1,0 +1,304 @@
+---
+title: "bash pipeline"
+subtitle: "_Tomato TET3 BS-seq screening test_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook:
+    theme: darkly
+    highlight: pygments
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    code_folding: "none"
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+bash variables
+```{bash}
+dir="/path/to/project/bsseq_screening" # double quotes important
+genome="/path/to/genome/v4_Mt_Pt_TET3/S_lycopersicum_chromosomes.4.00_Mt_Pt_TET3.fa"
+```
+
+
+# 0. Get data
+
+Place yourself in folder (name of your choice). You will need to run it again if you close the terminal
+```{bash}
+dir="/path/to/project/bsseq_screening" # double quotes important
+mkdir $dir
+```
+
+Make directories for analysis
+```{bash}
+cd $dir
+mkdir data data/1_raw data/2_trimmed data/3_mapped
+mkdir qa     qa/1_raw   qa/2_trimmed   qa/3_mapped
+```
+
+get data from `Shared210`
+```{bash}
+mkdir $dir/data/0_basecalls
+cp -rv /path/to/data/2018_01_15_Tomato_test/180103_NB501709_0033_AHWG2MAFXX/ $dir/data/0_basecalls
+```
+
+Demultiplex the basecalls using Illumina `bcl2fastq`
+```{bash}
+cd $dir/data/0_basecalls/180103_NB501709_0033_AHWG2MAFXX/
+bcl2fastq -p 40 --output-dir ../../1_raw --no-lane-splitting
+```
+
+The fastq files are single end (150 cycles)
+
+Rename the files (remove the sample name and lane from filename). sample names had been properly asigned in the demultiplexed stage
+```{bash}
+# rename the files (remove the rubbish)
+cd $dir/data/1_raw
+for i in *.fastq.gz; do
+  mv $i ${i/_S*_R1_001.fastq./.R1.fq.}
+done
+```
+
+Copy the fastq back to the Shared210
+```{bash}
+cp -rv $dir/data/1_raw/* /path/to/data/2018_01_15_Tomato_test/
+```
+
+
+# 1. Quality control with [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)
+
+The quality of the sequencing data was first checked with FastQC.
+```{bash}
+cd $dir
+fastqc -t 16 --quiet -o qa/1_raw/ data/1_raw/*fq.gz
+# aggregate results in one file
+multiqc --filename qa/1_raw/01_raw_FastQC_multiqc qa/1_raw
+```
+
+# 2. Trim with [Fastp](https://github.com/OpenGene/fastp#fastp)
+
+Trimming was performed with `fastp` with parameters `--trim_front1 6 --trim_tail1 1 --cut_right --cut_window_size 4 --cut_mean_quality 20 --length_required 40 --overrepresentation_analysis`.
+
+Parameters `--trim_front1 6 -trim_tail1 1` were added as to be equivalent to Julia's original trimming of the data in 2018.
+
+```{bash}
+cd $dir/data/1_raw
+for i in *.R1.fq.gz; do
+  fastp --thread 16 --trim_front1 6 --trim_tail1 1 \
+    --cut_right --cut_window_size 4 --cut_mean_quality 20 --length_required 40 \
+    --overrepresentation_analysis \
+    -i $i -o ../2_trimmed/${i/.R1./.R1.trimmed.} \
+    -h ../../qa/2_trimmed/${i%.R1.*}_fastp.html \
+    -j ../../qa/2_trimmed/${i%.R1.*}_fastp.json ;
+done
+wait
+# Multiqc reports of fastp
+cd $dir
+multiqc --filename qa/2_trimmed/02_trimmed_fastp_multiqc qa/2_trimmed
+```
+
+fastQC after trimming
+```{bash}
+cd $dir
+fastqc -t 16 --quiet -o qa/2_trimmed/ data/2_trimmed/*fq.gz
+# aggregate results in one file
+multiqc --filename qa/2_trimmed/02_trimmed_FastQC_multiqc qa/2_trimmed
+```
+
+# 3. Mapping with [Bismark](https://github.com/FelixKrueger/Bismark/tree/master/Docs)
+
+Before mapping or indexing, I add the transgene to the sequence and the gtf following Alex's example from HCPro. I explained this in the Tomato genome preparation Markdown.
+
+Set variable to fasta
+```{bash}
+genome="/path/to/genome/v4_Mt_Pt_TET3/S_lycopersicum_chromosomes.4.00_Mt_Pt_TET3.fa"
+```
+
+**Mapping cannot be done with BWA-meth as this BS-seq protocol is non-directional (CTOT & CTOB reads are sequenced), and Bwa-meth cant handle it**. Therefore Bismark followed by either the bismark methylation extractor is the only option.
+
+Steps:
+
+* bismark_genome_preparation
+* bismark
+* deduplicate_bismark
+* bismark_methylation_extractor
+
+## 3.1. Genome preparation
+
+Index the reference for Bismark first (if it is not present already)
+```{bash}
+if [ ! -d $(dirname $genome)/Bisulfite_Genome ]; then
+  bismark_genome_preparation --verbose $(dirname $genome)
+fi
+```
+
+## 3.2. Mapping
+
+And then run the mapping. It needs to be with parameter `--non_directional` because of the design of these libraries (most reads will map to the complementary of the bisulfite converted top strand or the complementary of the bottom strand)
+
+```{bash}
+cd $dir/data/2_trimmed
+time_file="../timing_mapping_bismark.tsv"
+printf "sample\tstart\tend\n" > $time_file
+for i in *.R1.trimmed.fq.gz; do
+  printf "$i\t$(date '+%Y/%m/%d %H:%M:%S')\t" >> $time_file &&
+  bismark --non_directional --multicore 4 --genome $(dirname $genome) $i -o ../3_mapped ;
+  printf "$(date '+%Y/%m/%d %H:%M:%S')\n" >> $time_file ;
+done # 7.5 h
+```
+
+## 3.3. Deduplication
+
+Mapped reads were deduplicated using `deduplicate_bismark`.
+```{bash}
+cd $dir/data/3_mapped
+time_file="../timing_deduplication_bismark.tsv"
+printf "sample\tstart\tend\n" > $time_file
+for i in *_bt2.bam; do
+  printf "$i\t$(date '+%Y/%m/%d %H:%M:%S')\t" >> $time_file &&
+  deduplicate_bismark --bam --single $i &&
+  printf "$(date '+%Y/%m/%d %H:%M:%S')\n" >> $time_file ;
+done # 25 min
+```
+
+## 3.4. Methylation Extraction 
+
+Make CX_reports with Bismark methylation extractor. Using `bismark_methylation_extractor` with parameters `--cytosine_report --CX` is really to run the following commands in one `bismark_methylation_extractor`, `bismark2bedGraph` & `coverage2cytosine`.
+```{bash}
+cd $dir/data/3_mapped
+time_file="../timing_methylation_extraction_bismark.tsv"
+printf "sample\tstart\tend\n" > $time_file
+for i in *.deduplicated.bam; do   
+  printf "$i\t$(date '+%Y/%m/%d %H:%M:%S')\t" >> $time_file &&   
+  bismark_methylation_extractor --multicore 2 --ignore_r2 2 --cytosine_report \
+    --CX --gzip --genome_folder $(dirname $genome) $i 2> $i.methext.log &&
+  rm C??_*O?_${i%.bam}.txt.gz ${i%.bam}.bedGraph.gz ${i%.bam}.bismark.cov.gz &&
+  printf "$(date '+%Y/%m/%d %H:%M:%S')" >> $time_file ;
+  printf "\n" >> $time_file ;
+done # 19 h / 12 h
+```
+
+Sort the CX_reports, as each file has a different order of chromosomes. (Maybe make a feature request in Bismark github page to get them sorted already)
+```{bash}
+cd $dir/data/3_mapped
+time_file="../timing_CX_sorting.tsv"
+printf "sample\tstart\tend\n" > $time_file
+for i in *.CX_report.txt; do
+  printf "$i\t$(date '+%Y/%m/%d %H:%M:%S')\t" >> $time_file &&
+  sort -k1,1V -k2,2n $i --parallel 8 > $i.sorted &&
+  mv $i.sorted $i &&
+  printf "$(date '+%Y/%m/%d %H:%M:%S')" >> $time_file ;
+  printf "\n" >> $time_file ;
+done # 4 h
+```
+
+## 3.5. Cleaning & Reports
+
+Clean the filenames to remove `.R1.trimmed`
+```{bash}
+cd $dir/data/3_mapped
+for i in *.R1.trimmed*; do
+  mv $i ${i/.R1.trimmed/}
+done
+```
+
+Bismark reports
+```{bash}
+cd $dir/data/3_mapped
+bismark2report
+bismark2summary
+```
+
+Move CX_reports & clean the filenames
+```{bash}
+cd $dir/data/3_mapped
+mkdir ../4_methylation
+for i in *.CX_report.txt*; do
+  mv $i ../4_methylation/${i/_bismark_bt2.deduplicated/}
+done
+```
+
+Move qa reports to `qa`
+```{bash}
+cd $dir/data/3_mapped
+mv *_report* ../../qa/3_mapped/
+mv *M-bias*  ../../qa/3_mapped/
+```
+ 
+Multiqc reports of bismark
+```{bash}
+cd $dir/qa/3_mapped
+multiqc --filename 03_mapped_bismark_multiqc .
+```
+
+Sorting and index for Samtools stats and later for BAMscale
+```{bash}
+cd $dir/data/3_mapped
+for i in *.deduplicated.bam; do
+  samtools sort -@40 -o ${i%.bam}.sorted.bam $i &&
+  samtools index ${i%.bam}.sorted.bam ;
+done
+```
+
+Samtools `flagstats` and `idxstats` and `stats`. Most of the results are meaningless, but the idxstats expected mapped reads per chromosome hints the chromosomal abnormality in chromosome 9.
+```{bash}
+cd $dir/data/3_mapped
+mkdir ../../qa/3_mapped/samtools
+for i in *sorted.bam; do
+  (samtools flagstat $i > ../../qa/3_mapped/samtools/${i%.sorted.bam}.flagstats.txt && \
+  samtools idxstats $i  > ../../qa/3_mapped/samtools/${i%.sorted.bam}.idxstats.txt && \
+  samtools    stats $i  > ../../qa/3_mapped/samtools/${i%.sorted.bam}.stats.txt) ;
+done
+wait
+# now condense reports with multiqc
+cd ../../qa/3_mapped
+multiqc --filename 03_mapped_samtools_multiqc samtools/
+```
+
+# 4. Generating tracks (bigwigs)
+
+Make BigWigs of methylation (%mC)
+```{bash}
+cd $dir/data/4_methylation
+mkdir ../5_tracks
+for i in *.CX_report.txt; do
+  CX_report2bigwig.sh -i $i -g ${genome/.fa/.chrom.sizes} -o ../5_tracks ;
+done
+```
+
+Make BigWig of coverage from BAM files
+```{bash}
+cd $dir/data/3_mapped
+for i in *.deduplicated.sorted.bam; do
+  BAMscale scale -t 16 --binsize 10 --bam $i &&
+  mv $i.scaled.bw ../5_tracks/${i/_bismark_bt2.deduplicated.sorted.bam/.scaled.bw} ;
+  BAMscale scale -t 16 --scale no --operation unscaled --binsize 10 --bam $i &&
+  mv $i.unscaled.bw ../5_tracks/${i/_bismark_bt2.deduplicated.sorted.bam/.coverage.bw} ;
+done
+```
+
+# 5. Compute average mC in bins 
+
+Generate 100 kbp bins of methylation data. It creates one file per sample.
+```{bash}
+cd $dir/data/4_methylation
+for i in *.CX_report.txt; do
+  CX_report2summary_v0.2.pl -v --meth $i --bin 100000 ;
+done
+```
+
+Generate 100 kbp bins of methylation data. The new script `CX_report2mC_bins.v1.0.pl` has constant header column names, including sample. You can now control the file name, throw output to STDOUT and set `--no_header` so you can concatenate several outputs into a long table. 
+```{bash}
+cd $dir/data/4_methylation
+bins_file="tomato_tet3_screening.mC_bins.100kbp.tsv"
+printf "chr\tstart\tend\tcontext\tmR\treads_m\treads_n\tsample\n" > $bins_file
+for i in *.CX_report.txt; do
+  CX_report2mC_bins.v1.0.pl -v --meth $i --bin 100000 --no_header -o - >> $bins_file
+done
+```

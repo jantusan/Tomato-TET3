@@ -1,0 +1,1923 @@
+---
+title: "DMRcaller preparation"
+subtitle: "_Tomato TET3 BS-seq _"
+author: "Javier Antúnez Sánchez"
+date: "from May 2022 to `r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+    code_folding: hide
+---
+
+```{css, echo=FALSE}
+/* Move code folding buttons to the left */
+div.col-md-12 .pull-right {
+  float: left !important
+}
+```
+
+```{r mac-setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{bash vettel-dir-genome, include=FALSE, eval=FALSE}
+## Vettel
+#  bash variables
+dir="/path/to/project/bsseq_selected" # double quotes important
+genome="/path/to/genome/v4_Mt_Pt_TET3/S_lycopersicum_chromosomes.4.00_Mt_Pt_TET3.fa"
+```
+
+```{r mac-libraries-functions-variables, include=FALSE}
+## Mac R 
+# libraries ----
+library(plyranges)
+library(tidyverse)
+library(cowplot)
+theme_set(theme_cowplot())
+library(scales)
+library(patchwork)
+library(ggforce)
+library(ggplotify)
+library(ComplexHeatmap)
+library(shadowtext)
+library(GeneOverlap)
+library(RColorBrewer)
+library(kableExtra)
+library(slider)
+
+# functions ----
+reverselog_trans <- function(base = exp(1)) {
+  trans <- function(x) -log(x, base)
+  inv <- function(x) base^(-x)
+  trans_new(paste0("reverselog-", format(base)), trans, inv, 
+            log_breaks(base = base), 
+            domain = c(1e-100, Inf))
+}
+ 
+# global variables ----
+#                      replicas = c(wt_1  = "grey10",  wt_2  = "grey50", 
+#sample_colors <- list(pooled = c(wt    = "#999999", a17 = "#6495ed", a4 = "#ff0000"),
+#                                   a17_1 = "#0000cd", a17_2 = "#6495ed", 
+#                                   a4_1  = "#8b0000", a4_2  = "#ff0000"))
+#sample_colors <- list(pooled = c(wt    = brewer.pal(9, "Greys")[6], 
+#                                 a17 = brewer.pal(11, "RdYlBu")[10], 
+#                                 a4 = brewer.pal(11, "RdYlBu")[2]),
+#                      replicas = c(wt_1  = brewer.pal(9, "Greys")[7],  wt_2  = brewer.pal(9, "Greys")[4], 
+#                                   a4_1  = brewer.pal(9, "RdBu")[1], a4_2  = brewer.pal(9, "RdBu")[3]))
+#                                   a17_1 = brewer.pal(9, "RdBu")[9], a17_2 = brewer.pal(9, "RdBu")[7], 
+
+# Aesthetics to plot the PCA and other plots
+sample_colors <- list(pooled = c(WT  = "grey40", A4  = "tomato2", A17 = "slateblue2"),
+                      replicas = c(WT_1  = "grey60", WT_2  = "grey30", 
+                                   A4_1  = "tomato1", A4_2  = "tomato3", 
+                                   A17_1 = "slateblue1", A17_2 = "slateblue3"))
+#barplot(1:6, col = sample_colors$replicas)
+#barplot(1:3, col = sample_colors$pooled)
+```
+
+<div style="float:right">
+
+```{r mac-chrom-sizes, echo=FALSE}
+read_tsv("/path/to/genome/version_4/S_lycopersicum_chromosomes.4.00.chrom.sizes", 
+         col_types = cols(), col_names = c("Chromosome", "length (Mbp)")) %>% 
+  mutate(`length (Mbp)` = `length (Mbp)` / 1e6,
+         `length (Mbp)` = round(`length (Mbp)`, digits = 1)) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left") %>%
+  row_spec(7, background = "yellow")
+```
+
+</div>
+
+```{bash vettel-conda-env, eval=FALSE}
+## Vettel
+cd $dir/data/4_methylation
+#  Vettel has an outdated version of R, I updated it with conda. 
+#  I have a conda enviroment with the updated version of R caller `dmrs`
+conda activate dmrs
+# Open R in Vettel
+R
+```
+
+After mapping the BS-seq libraries to the genome with [Bismark](https://github.com/FelixKrueger/Bismark#bismark) and before calling DMRs with [DMRcaller](https://www.bioconductor.org/packages/release/bioc/vignettes/DMRcaller/inst/doc/DMRcaller.pdf) it is needed to check some characteristics of you methylation data to decide with method for DMR caller can be used. The parameters to check are:
+
+* Cytosine read coverage
+* Spatial correlation of Methylation levels between close cytosines
+
+After this you can try different methods of DMRcaller and different parameters to select the optimal for your case. The methods I tested are:
+
+* Noise filter
+* Bins
+* Replicas (with Bins)
+
+Inside each method it is useful to test the parameters of DMRcaller to decide the size of windows or bins and the minimun proportion difference to call a region DMR.
+
+This decisions will probably be different for the different contexts (CG, CHG, and CHH) as they behave biologically in different ways.
+
+As doing these test for the whole genome would take a long time, we use only the smallest chromosome as a sample, which for tomato is chromosome 6 (47 Mbp, see table to the right).
+
+```{bash vettel-subset-cx-reports, eval=FALSE}
+## Vettel bash
+#  extract from CX_reports the chromosome 6 (the smallest, 47 Mbp)
+cd $dir/data/4_methylation
+mkdir ch06
+for i in {wt_*,a17_*, a4_*}.CX_report.txt; do
+  grep -P '^SL4.0ch06\t' $i > ch06/${i/.CX/.ch06.CX} &
+done 
+```
+
+# 1. Methylation statistics 
+
+```{r vettel-libraries, eval=FALSE}
+## Vettel R 
+#  Inside R load libraries (cmd + alt + enter). 
+#  For some reason I couldn't install the whole tidyverse in Vettel, so I load parts of it separately
+# Libraries ----
+library(DMRcaller)
+library(plyranges)
+library(dplyr)
+library(forcats)
+library(readr)
+library(tictoc)
+```
+
+We can calculate **(1)** the read coverage per cytosine and **(2)** the spatial correlation between methylation levels for neighbouring cytosines.
+
+```{r vettel-load-cx-reports-and-pool-replicas, eval=FALSE}
+## Vettel R 
+# Load data into R ----
+getwd()
+setwd("ch06/")
+list.files()
+
+# load CX_reports iteratively, store them in a list of genomic ranges
+CX_reports <- GRangesList()
+for (sample in c("wt", "a17", "a4")) {
+  for (replica in 1:2) {
+    id <- paste(sample, replica, sep = "_")
+    CX_reports[[tolower(id)]] <- readBismark(paste0(id, ".ch06.CX_report.txt"))
+    save(CX_reports, file = "meth_all_ch06.Rdata")
+  }
+}
+
+# remove bad sample A4_1 
+CX_reports$a4_1 <-  NULL
+save(CX_reports, file = "meth_all_ch06.Rdata")
+
+# Pool together replicas, excluding sample A4_1 ----
+CX_pooled <- GRangesList(
+  wt  = poolTwoMethylationDatasets(CX_reports$wt_1, CX_reports$wt_2),
+  a4  = CX_reports$a4_2,
+  a17 = poolTwoMethylationDatasets(CX_reports$a17_1, CX_reports$a17_2)
+)
+save(CX_pooled, file = "meth_all_ch06_replicas_pooled.Rdata")
+```
+
+## 1.1. Cytosine Coverage {.tabset}
+
+The first thing to check is the read coverage of cytosines. If sequencing coverage is high enough (most cytosines are covered by at least some reads) you could identify individual DMCs (differentially methylated cytosines), using the Neighbourhood method of DMRcaller with no merging.
+
+Otherwise you can still identify DMRs (differentially methylated regions) using the different methods available in DMRcaller.
+
+***
+
+A17_2 and A4_1 (the bad replica that will be discarded) have quite low coverage, with over 20 % of the Cytosines having no reads mapping to them. This suggest that we shouldn't use individual replicas for computing DMRs.
+
+But after pooling the replicas together the coverage is reasonably high for WT and A17 samples, with at least 75 % of the cytosines have 5 reads or more covering them. for A4 (which is comprised only of A4_2 replica after the other replica has been discarded) only 25% of the cytosines have 5 reads or more.
+
+```{r vettel-compute-cytosine-coverage, eval=FALSE}
+# Replicas ----
+## DMRcaller function----
+# Breaks are the number of reads per cytosine (e.g. the proportion of cytosines that have 1-15 reads)
+# Store output in a tibble for easy plotting with ggplot2
+cytosine_coverage_replicas <- NULL
+for (sample in names(CX_reports)) {
+  for (context in c("CG", "CHG", "CHH")) {
+    coverage <- computeMethylationDataCoverage(methylationData =  CX_reports[[sample]], 
+                                               context = context, breaks = 1:15)  %>% 
+      enframe(name = "min_reads", value = "coverage") %>% 
+      mutate(min_reads = as.integer(min_reads),
+             context = context, 
+             sample = sample)
+    cytosine_coverage_replicas <- bind_rows(cytosine_coverage_replicas, coverage)
+  }
+}
+
+# Save methylation coverage as tsv table for plotting in Mac
+write_tsv(cytosine_coverage_replicas, file = "cytosine_coverage_ch06_replicas.tsv")
+
+## dplyr way ----
+# count reads per cytosyne for histograms
+cytosine_coverage_tbl_replicas <- NULL
+for (sample in names(CX_reports)) {
+  cytosine_coverage_tbl_replicas <- CX_reports[[sample]] %>% 
+    as_tibble() %>% 
+    group_by(readsN, context) %>% 
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(sample = sample) %>% 
+    bind_rows(cytosine_coverage_tbl_replicas, .)
+}
+
+# Save methylation coverage as tsv table for plotting in Mac
+write_tsv(cytosine_coverage_tbl_replicas, file = "cytosine_coverage_ch06_tbl_replicas.tsv")
+
+# Pooled ----
+## DMRcaller function----
+# Breaks are the number of reads per cytosine (e.g. the proportion of cytosines that have 1-15 reads)
+# Store output in a tibble for easy plotting with ggplot2
+cytosine_coverage_pooled <- NULL
+for (sample in names(CX_pooled)) {
+  for (context in c("CG", "CHG", "CHH")) {
+    coverage <- computeMethylationDataCoverage(methylationData =  CX_pooled[[sample]], 
+                                               context = context, breaks = 1:15)  %>% 
+      enframe(name = "min_reads", value = "coverage") %>% 
+      mutate(min_reads = as.integer(min_reads),
+             context = context, 
+             sample = sample)
+    cytosine_coverage_pooled <- bind_rows(cytosine_coverage_pooled, coverage)
+  }
+}
+
+# Save methylation coverage as tsv table for plotting in Mac
+write_tsv(cytosine_coverage_pooled, file = "cytosine_coverage_ch06_pooled.tsv")
+
+## dplyr way ----
+# count reads per cytosyne for histograms
+cytosine_coverage_tbl_pooled <- NULL
+for (sample in names(CX_pooled)) {
+  cytosine_coverage_tbl_pooled <- CX_pooled[[sample]] %>% 
+    as_tibble() %>% 
+    group_by(readsN, context) %>% 
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(sample = sample) %>% 
+    bind_rows(cytosine_coverage_tbl_pooled, .)
+}
+write_tsv(cytosine_coverage_tbl_pooled, file = "cytosine_coverage_ch06_tbl_pooled.tsv")
+```
+
+```{r mac-load-cytosine-coverage}
+## Mac R 
+cytosine_coverage_replicas <- read_tsv(file = "../data/4_methylation/ch06/cytosine_coverage_ch06_replicas.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+cytosine_coverage_tbl_replicas <- read_tsv("../data/4_methylation/ch06/cytosine_coverage_ch06_tbl_replicas.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+
+cytosine_coverage_pooled <- read_tsv(file = "../data/4_methylation/ch06/cytosine_coverage_ch06_pooled.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+cytosine_coverage_tbl_pooled <- read_tsv("../data/4_methylation/ch06/cytosine_coverage_ch06_tbl_pooled.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+```
+
+### Replicas separated {.tabset .tabset-pills}
+
+#### DMRcaller function
+
+```{r fig.width=7, fig.height=4}
+ggplot(cytosine_coverage_replicas, aes(x = min_reads, y = coverage, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_manual(values = sample_colors$replicas) +
+  scale_fill_manual(values = sample_colors$replicas) +
+  scale_x_continuous(breaks = c(1, seq(0, 15, by = 5))) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  labs(title = "Read coverage per cytosine", subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas separated",
+       caption = "proportion of the cytosines over a certain coverage threshold",
+       x = "minimun read threshold", y = "percent of Cs") +
+  theme(strip.background = element_rect(fill = "darkseagreen1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-replicas.pdf", height = 4, width = 7)
+```
+
+#### dplyr way {.active}
+
+```{r fig.width=7, fig.height=7}
+coverage_base_plot_replicas <- cytosine_coverage_tbl_replicas %>% 
+  group_by(sample, context) %>% 
+  mutate(total = sum(count),
+         freq = count / total, 
+         left = slide_dbl(freq, ~ 1 - sum(.), .before = Inf)) %>% 
+  ggplot(aes(x = readsN, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  scale_color_manual(values = sample_colors$replicas) +
+  scale_fill_manual(values = sample_colors$replicas) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::label_percent()) +
+  coord_cartesian(xlim = c(0, 15)) +
+  xlab("read coverage") +
+  theme(strip.background = element_rect(fill = "darkseagreen1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+  
+(coverage_base_plot_replicas +
+    geom_line(aes(y = freq), linewidth = 2, alpha = 0.5) +
+    geom_point(aes(y = freq), shape = 21, size = 2, color = 1) +
+    ylab("frequency"))  /
+  (coverage_base_plot_replicas +
+     geom_line(aes(x = readsN, y = left), linewidth = 2, alpha = 0.5) +
+     geom_point(aes(x = readsN, y = left), shape = 21, size = 2, color = 1) +
+     ylab("right tail")) +
+  plot_annotation(title = "Read coverage per cytosine", 
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas separated",
+                  caption = "Top: proportion of the cytosines with a certain coverage
+                             Bottom: proportion of the cytosines over a certain coverage threshold")  +
+  plot_layout(guides = "collect")
+
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-freq-replicas.pdf", height = 7, width = 7)
+```
+
+#### Violin and Boxplot
+
+```{r fig.width=7, fig.height=6, warning=FALSE}
+# boxplot from count
+boxviolin_plot_base_replicas <- ggplot(cytosine_coverage_tbl_replicas, aes(x = sample, y = readsN, fill = context, weight = count)) +
+  ylab("Reads per cytosine") +
+  theme(axis.title.x = element_blank())
+
+(boxviolin_plot_base_replicas +
+    geom_violin(color = "black", draw_quantiles = c(0.25, .5, .75)) +
+    guides(fill = "none")) /
+  (boxviolin_plot_base_replicas +
+     geom_boxplot(outlier.shape = 16, varwidth = FALSE, color = "black") + 
+     coord_cartesian(ylim = c(0, 15.25))) +
+  plot_annotation(title = "Read coverage per cytosine", 
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas separated",
+                  caption = "Top: Violin plot of full range
+                             Bottom: Boxplot zoomed for low values")  +
+  plot_layout(guides = "collect")
+
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-boxplot-replicas.pdf", height = 6, width = 8)
+```
+
+### Replicas pooled {.tabset .tabset-pills .active}
+
+#### DMRcaller function
+
+```{r fig.width=7, fig.height=4}
+ggplot(cytosine_coverage_pooled, aes(x = min_reads, y = coverage, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_manual(values = sample_colors$pooled) +
+  scale_fill_manual(values = sample_colors$pooled) +
+  scale_x_continuous(breaks = c(1, seq(0, 15, by = 5))) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  labs(title = "Read coverage per cytosine", subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas pooled",
+       caption = "proportion of the cytosines over a certain coverage threshold",
+       x = "minimun read threshold", y = "percent of Cs") +
+  theme(strip.background = element_rect(fill = "darkseagreen1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-pooled.pdf", height = 4, width = 7)
+```
+
+#### dplyr way {.active}
+
+```{r fig.width=7, fig.height=7}
+coverage_base_plot_pooled <- cytosine_coverage_tbl_pooled %>% 
+  group_by(sample, context) %>% 
+  mutate(total = sum(count),
+         freq = count / total, 
+         left = slide_dbl(freq, ~ 1 - sum(.), .before = Inf)) %>% 
+  ggplot(aes(x = readsN, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  scale_color_manual(values = sample_colors$pooled) +
+  scale_fill_manual(values = sample_colors$pooled) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::label_percent()) +
+  coord_cartesian(xlim = c(0, 20)) +
+  xlab("read coverage") +
+  theme(strip.background = element_rect(fill = "darkseagreen1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+  
+(coverage_base_plot_pooled +
+    geom_line(aes(y = freq), linewidth = 2, alpha = 0.5) +
+    geom_point(aes(y = freq), shape = 21, size = 2, color = 1) +
+    ylab("frequency"))  /
+  (coverage_base_plot_pooled +
+     geom_line(aes(x = readsN, y = left), linewidth = 2, alpha = 0.5) +
+     geom_point(aes(x = readsN, y = left), shape = 21, size = 2, color = 1) +
+     ylab("right tail")) +
+  plot_annotation(title = "Read coverage per cytosine", 
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas pooled",
+                  caption = "Top: proportion of the cytosines with a certain coverage
+                             Bottom: proportion of the cytosines over a certain coverage threshold")  +
+  plot_layout(guides = "collect")
+
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-freq-pooled.pdf", height = 7, width = 7)
+```
+
+#### Violin and Boxplot
+
+```{r fig.width=5, fig.height=6, warning=FALSE}
+# boxplot from count
+boxviolin_plot_base_pooled <- ggplot(cytosine_coverage_tbl_pooled, aes(x = sample, y = readsN, fill = context, weight = count)) +
+  ylab("Reads per cytosine") +
+  theme(axis.title.x = element_blank())
+
+(boxviolin_plot_base_pooled +
+    geom_violin(color = "black", draw_quantiles = c(0.25, .5, .75)) +
+    guides(fill = "none")) /
+  (boxviolin_plot_base_pooled +
+     geom_boxplot(outlier.shape = 16, varwidth = FALSE, color = "black") + 
+     coord_cartesian(ylim = c(0, 24.8))) +
+  plot_annotation(title = "Read coverage per cytosine", 
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas pooled",
+                  caption = "Top: Violin plot of full range
+                             Bottom: Boxplot zoomed for low values")  +
+  plot_layout(guides = "collect")
+
+ggsave(filename = "../figures/ch06-test/meth-stats/cytosine-coverage-ch06-boxplot-pooled.pdf", height = 6, width = 5)
+```
+
+## 1.2. Spatial correlation {.tabset}
+
+The second statistic to test is the Spatial correlation, which measures how much the methylation level of a specific cytosine can predict the methylation level of another cytosine located at a certain distance across the DNA strand. This is informative because it tells us whether the cytosines act as individual units or if their methylation is determined at a region level. Also for computation of DMRs, if there is a good correlation at a specific distance, you can expect cytosines within a window of said distance to behave similarly, and instead of comparing the methylation levels of just one cytosine, you could include the methylation levels of all the cytosines in a region, which provides you with more statistical power as the number of reads mapping to a region will be substantially higher.
+
+The spatial correlation depends on the organism and the context of the cytosine, as they follow different biological mechanisms.
+
+***
+
+For our data, all samples have a very similar spatial correlation, with A17 (both its replicas and after pooling them) showing less correlation, more noticeable in CG context.
+
+When looking at the differences between the contexts, we observe that both CG and CHG have a high correlation (around 80%) at short distances of up to 10 bp, while CHH has a low correlation (around 30%) at those distances. As cytosines get farer away the correlation gets smaller, as expected, but the drop happens earlier for CG and CHH than for CHG, which maintains a high correlation of around 75% for distances up to 1 Kbp, while CG correlation drops starting from 10 bp, being around 60% for 100 bp and 40% for 200bp.
+
+This suggest that we could use the Noise filter method for calling DMRs for CG and CHG, at least for short enough windows, as there is good spatial correlation. However, for CHH the spatial correlation is bad, so ideally we would like to use the Neighbourhood method to identify DMCs or, failing this, the Bins method.
+
+```{r compute-spatial-correlation, eval=FALSE}
+## Vettel R
+# Create a vector to store distances between cytosines to study
+correlation_distances <- c(1, 2, 5,
+                           10, 20, 50, 
+                           100, 200, 500, 
+                           1000, 2000, 5000,
+                           10000, 20000, 50000)
+
+# Replicas ----
+# Compute methylation spatial correlation using the function provided by DMRcaller.
+# Store output in a tibble for easy plotting with ggplot2
+spatial_correlation_replicas <- NULL
+for (sample in names(CX_reports)) {
+  for (context in c("CG", "CHG", "CHH")) {
+    correlation <- computeMethylationDataSpatialCorrelation(methylationData = CX_reports[[sample]], 
+                                                            context = context, distances = correlation_distances) %>% 
+      enframe(name = "distance", value = "correlation") %>% 
+      mutate(context = context, 
+             sample = sample)
+    spatial_correlation_replicas <- bind_rows(spatial_correlation_replicas, correlation)
+  }
+}
+
+# Save spatial correlation as tsv table for plotting in Mac
+write_tsv(spatial_correlation_replicas, file = "spatial_correlation_ch06_replicas.tsv")
+
+# Pooled ----
+# Compute methylation spatial correlation using the function provided by DMRcaller.
+# Store output in a tibble for easy plotting with ggplot2
+spatial_correlation_pooled <- NULL
+for (sample in names(CX_pooled)) {
+  for (context in c("CG", "CHG", "CHH")) {
+    correlation <- computeMethylationDataSpatialCorrelation(methylationData = CX_pooled[[sample]], 
+                                                            context = context, distances = correlation_distances) %>% 
+      enframe(name = "distance", value = "correlation") %>% 
+      mutate(context = context, 
+             sample = sample)
+    spatial_correlation_pooled <- bind_rows(spatial_correlation_pooled, correlation)
+  }
+}
+
+# Save spatial correlation as tsv table for plotting in Mac
+write_tsv(spatial_correlation_pooled, file = "spatial_correlation_ch06_pooled.tsv")
+```
+
+```{r load-spatial-correlation}
+## Mac R 
+spatial_correlation_replicas <- read_tsv(file = "../data/4_methylation/ch06/spatial_correlation_ch06_replicas.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+spatial_correlation_pooled <- read_tsv(file = "../data/4_methylation/ch06/spatial_correlation_ch06_pooled.tsv", col_types = cols()) %>% 
+  mutate(sample = toupper(sample))
+```
+
+### Replicas separated {.tabset .tabset-pills}
+
+#### By sample
+
+```{r fig.width=7, fig.height=7}
+spatial_correlation_plot_replicas <- ggplot(spatial_correlation_replicas, aes(x = distance, y = correlation, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_manual(values = sample_colors$replicas) +
+  scale_fill_manual(values = sample_colors$replicas) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  xlab("Distance between Cs (bp)") +
+  theme(strip.background = element_rect(fill = "lightsteelblue2"), panel.border = element_rect(colour = "black", linewidth = 1),
+        axis.line = element_blank())
+
+(spatial_correlation_plot_replicas + coord_cartesian(xlim = c(0, 500)) + theme(axis.text.x = element_text(angle = -45, hjust = 0))) /
+  spatial_correlation_plot_replicas + scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Spatial correlation of DNA methylation values",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas separated",
+                  caption = "top row: linear scale, bottom row: semilogarithmic scale")
+```
+
+#### By context {.active}
+
+```{r fig.width=9, fig.height=5, warning=FALSE}
+spatial_correlation_plot_context_replicas <- spatial_correlation_replicas %>% 
+  ggplot(aes(x = distance, y = correlation, color = context)) +
+  geom_smooth(method = "loess", formula = y ~ x) +
+  scale_fill_manual(values = sample_colors$replicas) +
+  scale_shape_manual(values = c(21, 24, 22)) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  guides(fill = guide_legend(override.aes = list(shape = 23))) +
+  xlab("Distance between Cs (bp)") +
+  theme(strip.background = element_blank(), panel.border = element_rect(colour = "black", linewidth =1),
+        axis.line = element_blank())
+
+(spatial_correlation_plot_context_replicas + 
+    geom_jitter(aes( fill = sample, shape = context), size = 2, width = 5, color = 1) +
+    coord_cartesian(xlim = c(0, 200)) + theme(axis.text.x = element_text(angle = -45, hjust = 0))) +
+  (spatial_correlation_plot_context_replicas + 
+     geom_jitter(aes( fill = sample, shape = context), size = 2, width = 0.1, color = 1) +
+     scale_x_continuous(trans='log10', breaks = scales::breaks_log(n = 6), labels = scales::label_number_si())) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Spatial correlation of DNA methylation values",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas separated",
+                  caption = "left: linear scale, right: semilogarithmic scale")
+ggsave(filename = "../figures/ch06-test/meth-stats/spatial-correlation-ch06-replicas.pdf", height = 5, width = 9)
+```
+
+### Replicas pooled {.tabset .tabset-pills .active}
+
+#### By sample
+
+```{r fig.width=7, fig.height=7}
+spatial_correlation_plot_pooled <- ggplot(spatial_correlation_pooled, aes(x = distance, y = correlation, color = sample, fill = sample)) +
+  facet_wrap(vars(context)) +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_manual(values = sample_colors$pooled) +
+  scale_fill_manual(values = sample_colors$pooled) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  xlab("Distance between Cs (bp)") +
+  theme(strip.background = element_rect(fill = "lightsteelblue2"), panel.border = element_rect(colour = "black", linewidth = 1),
+        axis.line = element_blank())
+
+(spatial_correlation_plot_pooled + coord_cartesian(xlim = c(0, 500)) + theme(axis.text.x = element_text(angle = -45, hjust = 0))) /
+  spatial_correlation_plot_pooled + scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Spatial correlation of DNA methylation values",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas pooled",
+                  caption = "top row: linear scale, bottom row: semilogarithmic scale")
+```
+
+#### By context {.active}
+
+```{r fig.width=9, fig.height=5}
+spatial_correlation_plot_linetype_pooled <- spatial_correlation_pooled %>% 
+  ggplot(aes(x = distance, y = correlation, color = context, fill = context, group = str_c(context, sample), shape = sample)) +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  geom_point(size = 2, color = 1) +
+  xlab("Distance (bp)") +
+  theme(strip.background = element_blank(), panel.border = element_rect(colour = "black", linewidth = 1),
+        axis.line = element_blank())
+
+(spatial_correlation_plot_linetype_pooled + coord_cartesian(xlim = c(0, 500)) + theme(axis.text.x = element_text(angle = -45, hjust = 0))) +
+  spatial_correlation_plot_linetype_pooled + 
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Spatial correlation of DNA methylation values",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nReplicas pooled",
+                  caption = "left: linear scale, right: semilogarithmic scale")
+ggsave(filename = "../figures/ch06-test/meth-stats/spatial-correlation-ch06-pooled.pdf", height = 5, width = 9)
+```
+
+# 2. DMRcaller tests
+
+```{r vettel-libraries-functions-DMRcaller, eval=FALSE}
+# Vettel 
+## Libraries ----
+library(DMRcaller)
+library(tibble)
+library(readr)
+library(plyranges)
+library(betareg)
+library(tictoc)
+## Function ----
+compute_dmrs <- function(methylation_data_1, methylation_data_2, context, min_prop, method = "bins", 
+                         size = 100, pvalue = 0.01, min_size = 50, min_gap = (2 * size)) {
+  computeDMRs(methylationData1 = methylation_data_1, methylationData2 = methylation_data_2,
+              context = context, method = method, windowSize = size, binSize = size, 
+              minSize = min_size, minGap = min_gap, test = "score", pValueThreshold = pvalue, 
+              minCytosinesCount = 1, minProportionDifference = min_prop, minReadsPerCytosine = 1, cores = 16)
+}
+```
+
+## 2.1. Noise filter method {.tabset .active} 
+
+Test for noise filtering method for:
+
+ * 2 samples: A4 & A17
+ * 3 contexts: CG, CHG, CHH
+ * 9 minimum proportion differences: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
+ * 9 window sizes: 10, 20, 50, 100, 200, 500, 1000, 2000, 5000
+ 
+for some reason this parameters where producing almost no DMRs (exclusively CG and very few: up to 10 for A17 loss & 1 for A4 gain).
+
+By tweaking the parameters it seems that the `pValueThreshold` doesn't work as expected, as even if you relax, the resulting DMRs will still have a very significant p-value, but you will get way more of them.
+
+The conclusion is that for noise filtering I will set the pValue at 0.9 and filter after DMRcaller has finished
+
+```{r noise-filter-vettel, eval=FALSE}
+# Vettel
+tic()
+load("meth_all_ch06_replicas_pooled.Rdata")
+toc()
+
+tic.clearlog()
+dmrs_ch06_noise <- list()
+for (sample in c("a17", "a4")) {
+  for (ctx in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        tic(paste(sample, ctx, min_prop_diff, size))
+        dmrs_ch06_noise[[sample]][[ctx]][[paste0("p", min_prop_diff)]][[paste0("s", size)]] <- compute_dmrs(
+          methylation_data_1 = CX_pooled$wt, methylation_data_2 = CX_pooled[[sample]],
+          context = ctx, min_prop = min_prop_diff, method = "noise_filter", pvalue = 0.9, size = size)
+        toc(log = TRUE)
+      }
+    }
+  }
+}
+tic.log() %>% unlist() %>% as_tibble() %>% write_tsv("dmrs_ch06_a17_a4_noise_windows_timing.tsv")
+
+save(dmrs_ch06_noise, file = "dmrs_ch06_a17_a4_noise_windows.Rdata")
+```
+
+```{r p-value-experiment-vettel, eval=FALSE}
+dmrs_pval <- list
+for (pval in c(0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9)) {
+  tic(pval)
+  dmrs_pval[[paste0("pv", pval)]] <- computeDMRs(
+    methylationData1 = CX_pooled$wt, methylationData2 = CX_pooled[[sample]],
+    context = "CG", method = "noise_filter", windowSize = 10, minSize = 50, minGap = 200, 
+    test = "score", pValueThreshold = pval,
+    minCytosinesCount = 1, minProportionDifference = 0.01, minReadsPerCytosine = 1, cores = 16)
+  toc()
+}
+
+tb_dmrs_noise <- filter(dmrs_pval$pv0.01, seqnames == "empty") %>% 
+  as_tibble()
+for (pval in c(0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9)) {
+  tb_dmrs_noise <- bind_rows(tb_dmrs_noise, 
+                       dmrs_pval[[paste0("pv", pval)]] %>% 
+                           as_tibble() %>% 
+                           mutate(pval = pval,
+                                  seqnames = str_remove(seqnames, "SL4.0")))
+}
+
+```
+
+```{r noise-filter-make-tibble}
+load("../data/4_methylation/ch06/dmrs_ch06_a17_a4_noise_windows.Rdata")
+
+tb_dmrs_noise <- filter(dmrs_ch06_noise$a17$CG$p0.1$s10, seqnames == "empty") %>% 
+  as_tibble()
+for (sample in c("a17", "a4")) {
+  for (context in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        tb_dmrs_noise <- bind_rows(tb_dmrs_noise, 
+                         dmrs_ch06_noise[[sample]][[context]][[paste0("p", min_prop_diff)]][[paste0("s", size)]] %>% 
+                           as_tibble() %>% 
+                           mutate(sample = sample,
+                                  min_prop = min_prop_diff,
+                                  size = size,
+                                  method = "noise_filter",
+                                  seqnames = str_remove(seqnames, "SL4.0")))
+      }
+    }
+  }
+}
+```
+
+```{r noise-filter-stats}
+stats_dmrs_noise <- tb_dmrs_noise %>%
+  filter(pValue < 0.01,
+         cytosinesCount >= 4) %>% 
+  group_by(sample, context, min_prop, size, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+
+write_tsv(stats_dmrs_noise, "../data/4_methylation/ch06/dmrs_ch06_a17_a4_noise_windows-stats.tsv")
+```
+
+### Number
+
+```{r fig.width=8, fig.height=6.5}
+ggplot(stats_dmrs_noise, aes(x = as_factor(size), y = as_factor(min_prop), fill = DMRs)) +
+  facet_grid(cols = vars(sample, regionType), rows = vars(context), scales = "free_y", space = "free") +
+  geom_rect(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "#340240") +
+  geom_tile() +
+  scale_fill_viridis_c(trans='log10', breaks = scales::breaks_log(n = 7), labels = label_number(scale_cut = cut_short_scale())) +
+  #scale_fill_viridis_c() +
+  labs(title = "DMRs with Noise filtering method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", 
+       x = "Moving window size",
+       y = "Minimun proportion difference") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5)) 
+
+dir.create("../figures/ch06-test/dmrs-noise-filter", showWarnings = FALSE)
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-heatmap-number.pdf", height = 6.5, width = 5)
+```
+
+### Length {.active}
+
+```{r fig.width=8, fig.height=6.5}
+ggplot(stats_dmrs_noise, aes(x = as_factor(size), y = as_factor(min_prop), fill = length)) +
+  facet_grid(cols = vars(sample, regionType), rows = vars(context), space = "free") +
+  geom_rect(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "#340240") +
+  geom_tile() +
+  scale_fill_viridis_c("Length\n(bp)", trans='log10', breaks = scales::breaks_log(n = 7), labels = label_number(scale_cut = cut_short_scale())) +
+  #scale_fill_viridis_c() +
+  labs(title = "DMRs with Noise filtering method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", 
+       x = "Moving window size",
+       y = "Minimun proportion difference") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5)) 
+
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-heatmap-length.pdf", height = 6.5, width = 5)
+```
+
+
+### by window size {.tabset .tabset-pills}
+
+#### number
+
+```{r fig.width=8, fig.height=5}
+ggplot(stats_dmrs_noise, aes(x = size, y = DMRs, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context, sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-size-number.pdf", height = 5, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=5}
+ggplot(stats_dmrs_noise, aes(x = size, y = length, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context, sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "length of DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Moving window size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-size-length.pdf", height = 5, width = 8)
+```
+
+### by minimun proportion difference {.tabset .tabset-pills}
+
+#### number
+
+```{r fig.width=8, fig.height=5}
+ggplot(stats_dmrs_noise, aes(x = min_prop, y = DMRs, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context, sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-min-prop-number.pdf", height = 5, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=5}
+ggplot(stats_dmrs_noise, aes(x = min_prop, y = length, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context, sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Moving\nwindow\nsize", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Length of DMRs with Noise filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-noise-filter/dmrs-noise-filter-min-prop-length.pdf", height = 5, width = 8)
+```
+
+### Volcano plot {.tabset .tabset-pills}
+
+#### 100 bp, mpd = 0.1
+
+```{r fig.width=6, fig.height=5}
+ggplot(tb_dmrs_noise %>% filter(size == 100, min_prop == 0.1, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.1, 0.1),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.5, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Noise Filter method",
+       subtitle = "Minimun proportion difference set at 0.1\nMoving window size set to 100 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-noise-filter/volcano-dmrs-noise-filter-s100-mp0.1.pdf", width = 6, height = 5)
+```
+
+#### 100 bp, mpd = 0.5
+
+```{r fig.width=6, fig.height=5, warning=FALSE}
+ggplot(tb_dmrs_noise %>% filter(size == 100, min_prop == 0.5, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.5, 0.5),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.5, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Noise Filter method",
+       subtitle = "Minimun proportion difference set at 0.5\nMoving window size set to 100 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-noise-filter/volcano-dmrs-noise-filter-s100-mp0.5.pdf", width = 6, height = 5)
+```
+
+```{r eval=FALSE}
+dmrs_ch06_noise$a17$CG$p0.1$s100 %>% 
+  filter(width > 500)
+
+dmrs_ch06_noise$a17$CHG$p0.1$s100 %>% 
+  filter(width > 1000)
+```
+
+## 2.2. Bins method {.tabset} 
+
+Test for bins method for:
+
+* 2 samples: A4 & A17
+* 3 contexts: CG, CHG, CHH
+* 9 minimum proportion differences: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
+* 9 bin sizes: 10, 20, 50, 100, 200, 500, 1000, 2000, 5000
+
+```{r bins-vettel, eval=FALSE}
+# Vettel
+tic()
+load("meth_all_ch06_replicas_pooled.Rdata")
+toc()
+
+tic.clearlog()
+dmrs_ch06_bins <- list()
+for (sample in c("a17", "a4")) {
+  for (ctx in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        tic(paste(sample, ctx, min_prop_diff, size))
+        dmrs_ch06_bins[[sample]][[ctx]][[paste0("p", min_prop_diff)]][[paste0("s", size)]] <- compute_dmrs(
+          methylation_data_1 = CX_pooled$wt, methylation_data_2 = CX_pooled[[sample]],
+          context = ctx, min_prop = min_prop_diff, method = "bins", size = size)
+        toc(log = TRUE)
+      }
+    }
+  }
+}
+tic.log() %>% unlist() %>% as_tibble() %>% write_tsv("dmrs_ch06_a17_a4_bins_timing.tsv")
+
+save(dmrs_ch06_bins, file = "dmrs_ch06_a17_a4_bins_size.Rdata")
+```
+ 
+```{r bins-make-tibble}
+load("../data/4_methylation/ch06/dmrs_ch06_a17_a4_bins_size.Rdata")
+#dmrs_ch06_bins$a17$CHG$p0.1$s10
+
+tb_dmrs_bins <- filter(dmrs_ch06_bins$a17$CG$p0.1$s10, seqnames == "empty") %>% 
+  as_tibble()
+for (sample in c("a17", "a4")) {
+  for (context in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        tb_dmrs_bins <- bind_rows(tb_dmrs_bins, 
+                         dmrs_ch06_bins[[sample]][[context]][[paste0("p", min_prop_diff)]][[paste0("s", size)]] %>% 
+                           as_tibble() %>% 
+                           mutate(sample = sample,
+                                  min_prop = min_prop_diff,
+                                  size = size,
+                                  method = "bins",
+                                  seqnames = str_remove(seqnames, "SL4.0")))
+      }
+    }
+  }
+}
+```
+
+```{r bins-stats}
+stats_dmrs_bins <- tb_dmrs_bins %>%
+  filter(cytosinesCount >= 4) %>% 
+  group_by(sample, context, min_prop, size, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+
+write_tsv(stats_dmrs_bins, "../data/4_methylation/ch06/dmrs_ch06_a17_a4_bins_size-stats.tsv")
+```
+
+```{r}
+tb_dmrs_bins %>% 
+  filter(sample == "a4", 
+         context == "CG", 
+         regionType == "loss",
+         size > 50) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames)) %>% 
+  as_granges() %>% 
+  write_gff3("../data/4_methylation/ch06/dmrs_ch06_bins_TET3_CG_loss_all-of-them.gff3")
+
+
+tb_dmrs_bins %>% 
+  filter(sample == "a4", 
+         context == "CHG", 
+         regionType == "loss",
+         size > 50) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames)) %>% 
+  as_granges() %>% 
+  write_gff3("../data/4_methylation/ch06/dmrs_ch06_bins_TET3_CHG_loss_all-of-them.gff3")
+
+tb_dmrs_bins %>% 
+  filter(sample == "a4", 
+         context == "CHH", 
+         regionType == "loss",
+         size > 50) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames)) %>% 
+  as_granges() %>% 
+  write_gff3("../data/4_methylation/ch06/dmrs_ch06_bins_TET3_CHH_loss_all-of-them.gff3")
+
+```
+
+
+### Number
+
+```{r fig.width=8, fig.height=6.5}
+ggplot(stats_dmrs_bins, aes(x = as_factor(size), y = as_factor(min_prop), fill = DMRs)) +
+  facet_grid(cols = vars(sample, regionType), rows = vars(context), space = "free") +
+  geom_rect(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "#340240") +
+  geom_tile() +
+  scale_fill_viridis_c(trans='log10', breaks = scales::breaks_log(n = 7), labels = label_number(scale_cut = cut_short_scale())) +
+  #scale_fill_viridis_c() +
+  labs(title = "DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", 
+       x = "Moving window size",
+       y = "Minimun proportion difference") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5)) 
+
+dir.create("../figures/ch06-test/dmrs-bins", showWarnings = FALSE)
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-heatmap-number.pdf", height = 6.5, width = 8)
+```
+
+### Length {.active}
+
+```{r fig.width=8, fig.height=6.5}
+ggplot(stats_dmrs_bins, aes(x = as_factor(size), y = as_factor(min_prop), fill = length)) +
+  facet_grid(cols = vars(sample, regionType), rows = vars(context), space = "free") +
+  geom_rect(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "#340240") +
+  geom_tile() +
+  scale_fill_viridis_c("Length\n(bp)", trans='log10', breaks = scales::breaks_log(), labels = label_number(scale_cut = cut_short_scale())) +
+  #scale_fill_viridis_c() +
+  labs(title = "DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", 
+       x = "Moving window size",
+       y = "Minimun proportion difference") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5)) 
+
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-heatmap-length.pdf", height = 6.5, width = 8)
+```
+
+
+
+### by window size {.tabset .tabset-pills}
+
+#### number
+
+```{r fig.width=8, fig.height=8}
+ggplot(stats_dmrs_bins, aes(x = size, y = DMRs, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Bin size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-size-number.pdf", height = 8, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=8}
+ggplot(stats_dmrs_bins, aes(x = size, y = length, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth = 2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "length of DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Bin size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-size-length.pdf", height = 8, width = 8)
+```
+
+### by minimun proportion difference {.tabset .tabset-pills}
+
+For Bin sizes bigger than 20 bp, the length covered by DMRs decreases exponentially with the increase in minimum proportion difference.
+
+#### number
+
+```{r fig.width=8, fig.height=8}
+ggplot(stats_dmrs_bins, aes(x = min_prop, y = DMRs, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Bins filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-min-prop-number.pdf", height = 8, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=8}
+ggplot(stats_dmrs_bins, aes(x = min_prop, y = length, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Length of DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-min-prop-length.pdf", height = 8, width = 8)
+```
+
+#### length, size = 50
+
+```{r fig.width=6, fig.height=8}
+(ggplot(stats_dmrs_bins %>% filter(size == 50), 
+       aes(x = min_prop, y = length, color = context, fill = context, group = context)) +
+  facet_grid(cols = vars(sample), rows = vars(regionType), scales = "free", space = "free") +
+  #geom_line(linewidth =2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x, alpha = 0.4) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) /
+
+(ggplot(stats_dmrs_bins %>% filter(size == 50), 
+       aes(x = min_prop, y = length, color = context, fill = context, group = context)) +
+  facet_grid(cols = vars(sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_col(color = 1, position = "dodge") +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+  plot_annotation(title = "Length of DMRs with Bins method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nBin size set to 50 bp") +
+  plot_layout(guides = "collect")
+ggsave2("../figures/ch06-test/dmrs-bins/dmrs-bins-min-prop-length_s50.pdf", height = 8, width = 6)
+```
+
+### Volcano plot {.tabset .tabset-pills}
+
+#### 50 bp, mpd = 0.1
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_bins %>% filter(size == 50, min_prop == 0.1, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.1, 0.1),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Bins method",
+       subtitle = "Minimun proportion difference set at 0.1\nBin size set to 50 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-bins/volcano-dmrs-bins-s50-mp0.1.pdf", width = 6, height = 7)
+```
+
+#### 50 bp, mpd = 0.3
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_bins %>% filter(size == 50, min_prop == "0.3", cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.3, 0.3),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Bins method",
+       subtitle = "Minimun proportion difference set at 0.3\nBin size set to 50 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-bins/volcano-dmrs-bins-s50-mp0.3.pdf", width = 6, height = 7)
+```
+
+#### 50 bp, mpd = 0.4
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_bins %>% filter(size == 50, min_prop == 0.4, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.4, 0.4),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Bins method",
+       subtitle = "Minimun proportion difference set at 0.3\nBin size set to 50 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-bins/volcano-dmrs-bins-s50-mp0.4.pdf", width = 6, height = 7)
+```
+
+#### 100 bp, mpd = 0.1
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_bins %>% filter(size == 100, min_prop == 0.1, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.1, 0.1),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Bins method",
+       subtitle = "Minimun proportion difference set at 0.1\nBin size set to 100 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-bins/volcano-dmrs-bins-s100-mp0.1.pdf", width = 6, height = 7)
+```
+
+```{r, eval=FALSE}
+dmrs_ch06_noise$a17$CG$p0.5$s100 %>% 
+  filter(width > 500)
+
+dmrs_ch06_noise$a17$CHG$p0.1$s100 %>% 
+  filter(width > 1000)
+
+dmrs_ch06_bins$a17$CG$p0.5$s100 %>% 
+  filter(width > 500)
+
+dmrs_ch06_bins$a17$CHH$p0.5$s50 %>% 
+  filter(width > 100)
+```
+
+### colplot
+
+```{r fig.width=6, fig.height=7}
+(tb_dmrs_bins %>%
+  filter(size == 50, min_prop == "0.3") %>% 
+  group_by(sample, context, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop") %>% 
+  ggplot(aes(x = context, y = DMRs, fill = regionType, label = DMRs)) + 
+  facet_grid(cols = vars(sample), switch = "x", ) +
+  geom_col(color = "black", width = 0.8) + 
+  geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  scale_fill_manual (values = c("grey90", "grey10")) +
+  theme(legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), #strip.background = element_blank(),
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank(), strip.placement = "outside")) /
+(tb_dmrs_bins %>%
+  filter(size == 50, min_prop == "0.3") %>% 
+  group_by(sample, context, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop") %>% 
+  ggplot(aes(x = context, y = length, fill = regionType, label = str_c(length/1000, " kb"))) + 
+  facet_grid(cols = vars(sample), switch = "x", ) +
+  geom_col(color = "black", width = 0.8) + 
+  geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  scale_fill_manual (values = c("grey90", "grey10")) +
+  theme(legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), #strip.background = element_blank(),
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank(), strip.placement = "outside")) /
+  guide_area() +
+  plot_annotation(title = "DMRs with Bins method",
+                  subtitle = "Numbers and length of DMRs\nMinimun proportion difference set at 0.3\nBin size set to 50 bp") +
+  plot_layout(guides = "collect", heights = c(4, 4, 1))
+#ggsave(filename = "../figures/ch06-test/dmrs-bins/colplot_dmrs_bins_p0.5.pdf", width = 6, height = 7)
+```
+
+## 2.3. Replicas (bins method) {.tabset}
+
+When computing DMRs using the replicas method, the algorithm uses beta regression statistical test instead of the Score/Fisher that the other methods use, which gives different statistics in the volcano plot (see how different they look to the bins method with the score test).
+
+```{r replicas-vettel, eval=FALSE}
+# Vettel
+## 1. Join replicas for DMR calling ----
+load("meth_all_ch06.Rdata") 
+
+# Join replicas (and not replicas, it is a poorly named function)
+meth_ch06_joined <- joinReplicates(CX_reports$wt_1, CX_reports$wt_2)
+for (i in 3:4) {
+  tic()
+  meth_ch06_joined <- joinReplicates(meth_ch06_joined, CX_reports[[i]])
+  toc()
+}
+save(meth_ch06_joined, file = "meth_a17_ch06_joined.Rdata")
+
+## 2. Call DMRs ----
+load("meth_a17_ch06_joined.Rdata") 
+genotype = c("wt", "wt", "a17", "a17")
+
+# example fot just CG
+tic()
+dmrs_a17_ch06_cg <- computeDMRsReplicates(
+  methylationData = meth_ch06_joined, condition = genotype, context = "CG", method = "bins", binSize = 100, minGap = 200, 
+  minProportionDifference = 0.4, pValueThreshold = 0.01, minReadsPerCytosine = 1, cores = 16)
+toc()
+#save(dmrs_a17_ch06_cg, file = "dmrs_a17_ch06_cg.Rdata")
+
+### DMR caller test for a range of minimum proportion differences
+# the number of cores seems to bring errors, if it is 10, randomly CHH with more than 0.3 min_prop doesn't work
+dmrs_replicas <- function(meth_data, context, min_prop) {
+  genotype = c("wt", "wt", "a17", "a17")
+  computeDMRsReplicates(methylationData = meth_data, condition = genotype, 
+                        method = "bins", binSize = 100, minGap = 200, 
+                        pValueThreshold = 0.01, minReadsPerCytosine = 1, cores = 10,
+                        context = context, minProportionDifference = min_prop)
+}
+
+tic.clearlog()
+dmrs <- list()
+for (context in c("CG", "CHG", "CHH")) {
+  for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+    tic(paste(context, min_prop_diff))
+    dmrs[[context]][[as.character(min_prop_diff)]] <- dmrs_replicas(meth_ch06_joined, context, min_prop_diff)
+    toc(log = TRUE)
+  }
+}
+tic("saving")
+save(dmrs, file = "meth_ch06_list_min_props_.Rdata")
+toc()
+
+(tic.log() %>% unlist() %>% as_tibble() %>% write_tsv("dmrs_a17_test_minprop_timing_.tsv"))
+```
+
+```{r replicas-make-tibble}
+load("../data/4_methylation/ch06/meth_ch06_list_min_props.Rdata")
+
+tb_dmrs_replicas <- filter(dmrs$CG$`0.1`, seqnames == "empty") %>% 
+  as_tibble()
+for (context in c("CG", "CHG", "CHH")) {
+  for (min_prop_diff in names(dmrs$CG)) { # check this, numbers are tricky as list accesors
+    tb_dmrs_replicas <- bind_rows(tb_dmrs_replicas,
+                                  dmrs[[context]][[as.character(min_prop_diff)]] %>% 
+                                    as_tibble() %>% 
+                                    mutate(min_prop = min_prop_diff,
+                                           method = "replicas",
+                                           seqnames = str_remove(seqnames, "SL4.0")))
+  }
+}
+tb_dmrs_replicas <- tb_dmrs_replicas %>% 
+  mutate(min_prop = as.numeric(min_prop))
+```
+
+```{r replicas-stats}
+stats_dmrs_replicas <- tb_dmrs_replicas %>%
+  filter(pValue < 0.01,
+         cytosinesCount >= 4) %>% 
+  group_by(context, min_prop, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+```
+
+### by minimun proportion difference, size = 100 {.tabset .tabset-pills}
+
+#### number
+
+```{r fig.width=8, fig.height=6, warning=FALSE}
+(ggplot(stats_dmrs_replicas, aes(x = min_prop, y = DMRs, color = context, fill = context, group = context)) +
+  facet_grid(rows = vars(regionType), scales = "free", space = "free") +
+  #geom_line(linewidth =2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x, alpha = 0.4) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+(ggplot(stats_dmrs_replicas, aes(x = min_prop, y = DMRs, color = context, fill = context, group = context)) +
+  facet_grid(rows = vars(regionType), scales = "free", space = "free") +
+  geom_col(color = 1, position = "dodge") +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+  plot_annotation(title = "DMRs with Replicas (bins method)",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nBin size set to 100 bp") +
+  plot_layout(guides = "collect")
+ggsave2("../figures/ch06-test/dmrs_replicas_bin/dmrs-replicas-min-prop-number-s100.pdf", height = 6, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=6, warning=FALSE}
+(ggplot(stats_dmrs_replicas, aes(x = min_prop, y = length, color = context, fill = context, group = context)) +
+  facet_grid(rows = vars(regionType), scales = "free", space = "free") +
+  #geom_line(linewidth =2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x, alpha = 0.4) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+(ggplot(stats_dmrs_replicas, aes(x = min_prop, y = length, color = context, fill = context, group = context)) +
+  facet_grid(rows = vars(regionType), scales = "free", space = "free") +
+  geom_col(color = 1, position = "dodge") +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+  plot_annotation(title = "Length of DMRs with Replicas (bins method)",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nBin size set to 100 bp") +
+  plot_layout(guides = "collect")
+ggsave2("../figures/ch06-test/dmrs_replicas_bin/dmrs-replicas-min-prop-length-s100.pdf", height = 6, width = 8)
+```
+
+### Volcano plot {.tabset .tabset-pills}
+
+#### 100 bp, mpd = 0.1
+
+```{r fig.width=4, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_replicas %>% filter(min_prop == 0.1, cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(rows = vars(context)) +
+  geom_vline(xintercept = c(-0.1, 0.1),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with\nReplicas (bins method)",
+       subtitle = "Minimun proportion difference set at 0.1\nBin size set to 100 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs_replicas_bin/volcano-dmrs-replicas-s100-mp0.1.pdf", width = 4, height = 7)
+```
+
+## 2.4. Neighbourhood method {.tabset}
+
+The coverage after pooling the replicas maybe is enough to try the neighbourhood method to call single Differentially Methylated Cytosines. I should try that later.
+
+Test for Neighbourhood method for:
+
+* 2 samples: A4 & A17
+* 3 contexts: CG, CHG, CHH
+* 9 minimum proportion differences: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
+* 10 min sizes: 1, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000
+* 3 minimum Gap sizes: 0 (for DMCs), 200, 2x(size)
+
+```{r neighbourhood-vettel, eval=FALSE}
+# Vettel
+tic()
+load("meth_all_ch06_replicas_pooled.Rdata")
+toc()
+
+tic.clearlog()
+dmrs_ch06_neighbourhood <- list()
+for (sample in c("a17", "a4")) {
+  for (ctx in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(1, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        for (min_gap in c(0, 200, "2x")) {
+          min_gap_n = ifelse(min_gap == "2x", 2 * size, as.numeric(min_gap))
+          tic(paste(sample, ctx, min_prop_diff, size, min_gap))
+          dmrs_ch06_neighbourhood[[sample]][[ctx]][[paste0("p", min_prop_diff)]][[paste0("s", size)]][[paste0("g", min_gap)]] <- compute_dmrs(
+            methylation_data_1 = CX_pooled$wt, methylation_data_2 = CX_pooled[[sample]],
+            context = ctx, min_prop = min_prop_diff, method = "neighbourhood", min_size = size, min_gap = min_gap_n)
+          toc(log = TRUE)
+        }
+      }
+    }
+  }
+}
+tic.log() %>% unlist() %>% as_tibble() %>% write_tsv("dmrs_ch06_a17_a4_neighbourhood_timing.tsv")
+
+save(dmrs_ch06_neighbourhood, file = "dmrs_ch06_a17_a4_neighbourhood_size.Rdata")
+```
+
+```{r neighbourhood-make-tibble}
+load("../data/4_methylation/ch06/dmrs_ch06_a17_a4_neighbourhood_size.Rdata")
+#dmrs_ch06_neighbourhood$a17$CHG$p0.1$s1$g0
+
+tb_dmrs_neighbourhood <- filter(dmrs_ch06_neighbourhood$a17$CG$p0.1$s1$g0, seqnames == "empty") %>% 
+  as_tibble()
+for (sample in c("a17", "a4")) {
+  for (context in c("CG", "CHG", "CHH")) {
+    for (min_prop_diff in seq(from = 0.1, to = 0.9, by = 0.1)) {
+      for (size in c(1, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)) {
+        for (min_gap in c(0, 200, "2x")) {
+          tb_dmrs_neighbourhood <- bind_rows(
+            tb_dmrs_neighbourhood, 
+            dmrs_ch06_neighbourhood[[sample]][[context]][[paste0("p", min_prop_diff)]][[paste0("s", size)]][[paste0("g", min_gap)]] %>%
+              as_tibble() %>% 
+              mutate(sample = sample,
+                     min_prop = min_prop_diff,
+                     size = size,
+                     method = "neighbourhood",
+                     min_gap = min_gap,
+                     seqnames = str_remove(seqnames, "SL4.0"))
+          )
+        }
+      }
+    }
+  }
+}
+```
+
+```{r neighbourhood-stats}
+stats_dmrs_neighbourhood <- tb_dmrs_neighbourhood %>%
+  #filter(cytosinesCount >= 4) %>% 
+  #filter(min_gap == "2x") %>% 
+  group_by(sample, context, min_prop, size, min_gap, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+```
+
+### by window size {.tabset .tabset-pills}
+
+#### number
+
+```{r fig.width=10, fig.height=8, warning=FALSE}
+ggplot(stats_dmrs_neighbourhood, aes(x = size, y = DMRs, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context, min_gap), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Neighbourhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Bin size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-neighbourhood/dmrs-neighbourhood-size-number.pdf", height = 8, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=10, fig.height=8, warning=FALSE}
+ggplot(stats_dmrs_neighbourhood, aes(x = size, y = length, color = min_prop, fill = min_prop, group = min_prop)) +
+  facet_grid(cols = vars(context, min_gap), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth() +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_fill_viridis_c("Minimun\nproportion\ndifference", breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_x_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "length of DMRs with Neighbourhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Bin size") +
+  theme(legend.key.height = unit(0.6, "cm"), strip.background = element_rect(colour = NA, fill = "lavender"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank()) 
+ggsave2("../figures/ch06-test/dmrs-neighbourhood/dmrs-neighbourhood-size-length.pdf", height = 8, width = 8)
+```
+
+### by minimun proportion difference {.tabset .tabset-pills}
+
+For Bin sizes bigger than 20 bp, the length covered by DMRs decreases exponentially with the increase in minimum proportion difference.
+
+#### number
+
+```{r fig.width=10, fig.height=8}
+ggplot(stats_dmrs_neighbourhood, aes(x = min_prop, y = DMRs, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context, min_gap), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "DMRs with Neighbourhood filter method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-neighbourhood/dmrs-neighbourhood-min-prop-number.pdf", height = 8, width = 8)
+```
+
+#### length {.active}
+
+```{r fig.width=8, fig.height=8}
+ggplot(stats_dmrs_neighbourhood, aes(x = min_prop, y = length, color = size, fill = size, group = size)) +
+  facet_grid(cols = vars(context, min_gap), rows = vars(regionType, sample), scales = "free", space = "free") +
+  geom_line(linewidth =2, alpha = 0.5) +
+  #geom_smooth(method = 'loess', formula = y ~ x) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_color_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_fill_viridis_c("Bin size", option = "C", trans='log10', breaks = c(10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3)) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(title = "Length of DMRs with Neighbourhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)", x = "Minimun proportion difference") +
+  theme(legend.key.height = unit(1, "cm"), strip.background = element_rect(colour = NA, fill = "lavenderblush"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave2("../figures/ch06-test/dmrs-neighbourhood/dmrs-neighbourhood-min-prop-length.pdf", height = 8, width = 8)
+```
+
+#### length, size = 50
+
+```{r fig.width=6, fig.height=8}
+(ggplot(stats_dmrs_neighbourhood %>% filter(size == 1, min_gap == 0), 
+       aes(x = min_prop, y = DMRs, color = context, fill = context, group = context)) +
+  facet_grid(cols = vars(sample), rows = vars(regionType), scales = "free", space = "free") +
+  #geom_line(linewidth =2, alpha = 0.5) +
+  geom_smooth(method = 'loess', formula = y ~ x, alpha = 0.4) +
+  geom_point(shape = 21, size = 2, color = 1) +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(trans='log10', breaks = scales::breaks_log(), labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) /
+
+(ggplot(stats_dmrs_neighbourhood %>% filter(size == 1, min_gap == 0), 
+       aes(x = min_prop, y = DMRs, color = context, fill = context, group = context)) +
+  facet_grid(cols = vars(sample), rows = vars(regionType), scales = "free", space = "free") +
+  geom_col(color = 1, position = "dodge") +
+  scale_x_continuous(breaks = seq(0.1, 0.9, by = 0.2)) +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  labs(x = "Minimun proportion difference") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())) +
+  plot_annotation(title = "Number of DMCs with Neighbourhood method",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nBin size set to 50 bp") +
+  plot_layout(guides = "collect")
+ggsave2("../figures/ch06-test/dmrs-neighbourhood/dmrs-neighbourhood-min-prop-DMCs.pdf", height = 8, width = 6)
+```
+
+### Volcano plot {.tabset .tabset-pills}
+
+#### DMCs (1 bp & g = 0), mpd = 0.1
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_neighbourhood %>% filter(size == 1, min_gap == 0, min_prop == 0.1), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context), scales = "free", space = "free") +
+  geom_vline(xintercept = c(-0.1, 0.1),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 1, alpha = 0.3, position = position_jitter(height = 0.05)) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), #limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMCs (Neighbourhood method)",
+       subtitle = "Minimun proportion difference set at 0.1\nBin size set to 1 bp\nMinimum gap set to 0 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-neighbourhood/volcano-dmrs-neighbourhood-s50-mp0.1.pdf", width = 6, height = 7)
+```
+
+#### 50 bp, mpd = 0.3
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+ggplot(tb_dmrs_neighbourhood %>% filter(size == 10, min_prop == "0.8", cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(xintercept = c(-0.3, 0.3),  color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 3, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs with Neighbourhood method",
+       subtitle = "Minimun proportion difference set at 0.3\nBin size set to 50 bp") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave(filename = "../figures/ch06-test/dmrs-neighbourhood/volcano-dmrs-neighbourhood-s50-mp0.3.pdf", width = 6, height = 7)
+```
+
+### colplot {.active}
+
+```{r fig.width=4, fig.height=5}
+tb_dmrs_neighbourhood %>%
+  filter(size == 1, min_prop == 0.5, min_gap == 0) %>% 
+  group_by(sample, context, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop") %>% 
+  ggplot(aes(x = context, y = DMRs, fill = regionType, label = DMRs)) + 
+  facet_grid(cols = vars(sample)) +
+  geom_col(color = "black", width = 0.8) + 
+  geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + 
+  scale_fill_manual (values = c("grey90", "grey10")) +
+  labs(title = "DMCs (Neighborhood method)", y = "DMCs",
+       subtitle = "Minimun proportion difference set at 0.5") +
+  theme(legend.position= "bottom", legend.justification = "center", legend.title = element_blank(),
+        strip.background = element_rect(fill = "cornsilk", color = 1, size = 1),
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())
+#ggsave(filename = "../figures/ch06-test/dmrs_neighborhood/colplot_DMCs_p0.5.pdf", width = 6, height = 7)
+```
+
+# 3. Final decisions {.tabset}
+
+I will pool replicas.
+
+For CG and CHG context I will use: 
+
+* noise filter method
+* window size = 100 bp
+* minimun proportion difference = 0.5
+
+For CHH I will use: 
+
+* bins method
+* window size = 50 bp
+* minimun proportion difference = 0.3
+
+## 3.1 rerun DMRs for ch06 with selected parameters {.tabset}
+
+```{r, eval=FALSE}
+# Vettel
+tic()
+load("meth_all_ch06_replicas_pooled.Rdata")
+toc()
+
+dmr_params <- list(
+  method   = c(CG = "noise_filter", CHG = "noise_filter", CHH = "bins"),
+  pvalue   = c(CG = 0.9, CHG = 0.9, CHH = 0.01),
+  size     = c(CG = 100, CHG = 100, CHH = 50),
+  min_prop = c(CG = 0.5, CHG = 0.5, CHH = 0.3)
+)
+
+tic.clearlog()
+dmrs_ch06_selected <- list()
+for (sample in c("a17", "a4")) {
+  for (ctx in c("CG", "CHG", "CHH")) {
+    tic(paste(sample, ctx))
+    dmrs_ch06_selected[[sample]][[ctx]] <- compute_dmrs(
+          methylation_data_1 = CX_pooled$wt, 
+          methylation_data_2 = CX_pooled[[sample]],
+          method   = dmr_params$method[[ctx]],
+          context  = ctx, 
+          pvalue   = dmr_params$pvalue[[ctx]],
+          size     = dmr_params$size[[ctx]], 
+          min_prop = dmr_params$min_prop[[ctx]])
+    toc(log = TRUE)
+  }
+}
+tic.log() %>% unlist() %>% as_tibble() %>% write_tsv("dmrs_ch06_decided_paramenters_timing.tsv")
+
+save(dmrs_ch06_selected, file = "dmrs_ch06_a17_a4_decided_paramenters.Rdata")
+```
+
+```{r dmrs-make-tibble}
+load("../data/4_methylation/ch06/dmrs_ch06_a17_a4_decided_paramenters.Rdata")
+
+tb_dmrs_ch06_selected <- filter(dmrs_ch06_selected$a17$CG, seqnames == "empty") %>% 
+  as_tibble()
+for (sample in c("a17", "a4")) {
+  for (context in c("CG", "CHG", "CHH")) {
+    tb_dmrs_ch06_selected <- bind_rows(tb_dmrs_ch06_selected,
+                                      dmrs_ch06_selected[[sample]][[context]] %>% 
+                                        as_tibble() %>% 
+                                        mutate(sample = sample,
+                                               seqnames = str_remove(seqnames, "SL4.0")))
+  }
+}
+```
+
+```{r filter-dmrs}
+tb_dmrs_selected_filtered <- tb_dmrs_ch06_selected %>%
+  filter(pValue < 0.01,
+         cytosinesCount >= 4) 
+```
+
+```{r dmrs-stats}
+stats_dmrs_selected <- tb_dmrs_selected_filtered %>% 
+  group_by(sample, context, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+```
+
+### Colplot
+
+```{r fig.width=6, fig.height=8}
+library(shadowtext)
+(ggplot(stats_dmrs_selected, aes(x = sample, y = DMRs, fill = regionType, label = DMRs)) + 
+  facet_grid(cols = vars(context), switch = "x") +
+  geom_col(color = "black", width = 0.8) + 
+  geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_y_continuous(labels = scales::label_number_si(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("grey90", "grey10")) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), strip.placement = "outside",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())) /
+  (ggplot(stats_dmrs_selected, aes(x = sample, y = length, fill = regionType, label = str_c(round(length/1000, 0), " kb"))) + 
+     facet_grid(cols = vars(context), switch = "x") +
+     geom_col(color = "black", width = 0.8) + 
+     geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+     #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+     scale_y_continuous(labels = scales::label_number_si(unit = "bp"), expand = expansion(mult = c(0, 0.05))) +
+     scale_fill_manual(values = c("grey90", "grey10")) +
+     theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+           legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), strip.placement = "outside",
+           axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())) /
+  guide_area() +
+  plot_annotation(title = "DMRs (decided parameters)",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nCG & CHG: Noise filter method, mpd = 0.5\nCHH: Bins method, mpd = 0.3") +
+  plot_layout(guides = "collect", heights = c(4, 4, 1))
+ggsave("../figures/ch06-test/colplot-DMRs-ch06-selected-parameters-2023-09.pdf", width = 6, height = 8)
+```
+
+### Volcano
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+vlines <- tibble(context = c("CG", "CHG", "CHH"),
+                  threshold = c(0.5, 0.5, 0.3))
+
+ggplot(tb_dmrs_selected_filtered, aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(data = vlines, aes(xintercept = threshold),  color = "dodgerblue3") +
+  geom_vline(data = vlines, aes(xintercept = -threshold), color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.4, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs (decided parameters)",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nCG & CHG: Noise filter method, mpd = 0.5\nCHH: Bins method, mpd = 0.3") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave("../figures/ch06-test/volcano-plot-DMRs-ch06-selected-parameters-2023-09.pdf", width = 6, height = 7)
+```
+
+## 3.2 extract DMRs from the already computed DMRs {.tabset}
+
+I get the same numbers and length of DMRs wether I recompute DMRs or I filter from the already computed list of DMRs of chromosome 6, which is a good sign that everything is working fine.
+
+```{r dmrs-chosen-parameters}
+dmrs_ch06_chosen_params <- list(
+  a17 = list(
+    CG = dmrs_ch06_noise$a17$CG$p0.5$s100,
+    CHG = dmrs_ch06_noise$a17$CHG$p0.5$s100, 
+    CHH = dmrs_ch06_bins$a17$CHH$p0.3$s50
+  ),
+  a4 = list(
+    CG = dmrs_ch06_noise$a4$CG$p0.5$s100,
+    CHG = dmrs_ch06_noise$a4$CHG$p0.5$s100, 
+    CHH = dmrs_ch06_bins$a4$CHH$p0.3$s50
+  )
+)
+```
+
+
+```{r dmrs-chosen-parameters-make-tibble}
+tb_dmrs_chosen_params <- filter(dmrs_ch06_chosen_params$a17$CG, seqnames == "empty") %>% 
+  as_tibble()
+for (sample in c("a17", "a4")) {
+  for (context in c("CG", "CHG", "CHH")) {
+    tb_dmrs_chosen_params <- bind_rows(tb_dmrs_chosen_params,
+                                      dmrs_ch06_chosen_params[[sample]][[context]] %>% 
+                                        as_tibble() %>% 
+                                        mutate(sample = sample)) %>%
+      mutate(seqnames = str_remove(seqnames, "SL4.0"))
+  }
+}
+```
+
+```{r dmrs-stats-chosen}
+stats_dmrs_chosen_params <- tb_dmrs_chosen_params %>%
+  filter(pValue < 0.01,
+         cytosinesCount >= 4) %>% 
+  group_by(sample, context, regionType) %>%
+  summarise(DMRs = n(), length = sum(width), .groups = "drop")
+```
+
+### Colplot
+
+```{r fig.width=6, fig.height=8}
+(ggplot(stats_dmrs_chosen_params, aes(x = sample, y = DMRs, fill = regionType, label = DMRs)) + 
+  facet_grid(cols = vars(context), switch = "x") +
+  geom_col(color = "black", width = 0.8) + 
+  geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+  scale_y_continuous(labels = scales::label_number_si(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("grey90", "grey10")) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+        legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), strip.placement = "outside",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())) /
+  (ggplot(stats_dmrs_chosen_params, aes(x = sample, y = length, fill = regionType, label = str_c(round(length/1000, 0), " kb"))) + 
+     facet_grid(cols = vars(context), switch = "x") +
+     geom_col(color = "black", width = 0.8) + 
+     geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+     #geom_text(position = position_stack(vjust = 0.5), color = "black") +
+     scale_y_continuous(labels = scales::label_number_si(unit = "bp"), expand = expansion(mult = c(0, 0.05))) +
+     scale_fill_manual(values = c("grey90", "grey10")) +
+     theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),
+           legend.position= "bottom", legend.justification = "center", legend.title = element_blank(), strip.placement = "outside",
+           axis.ticks.x = element_blank(), axis.title.x = element_blank(), axis.line.x = element_blank())) /
+  guide_area() +
+  plot_annotation(title = "DMRs for the chromosome 6 (decided parameters)",
+                  subtitle = "for chromosome 6 of tomato (47 Mbp)\nCG & CHG: Noise filter method, mpd = 0.5\nCHH: Bins method, mpd = 0.3") +
+  plot_layout(guides = "collect", heights = c(4, 4, 1))
+ggsave("../figures/ch06-test/colplot-DMRs-ch06-selected-parameters-2023-09-by-filter.pdf", width = 6, height = 8)
+```
+
+### Volcano
+
+```{r fig.width=6, fig.height=7, warning=FALSE}
+vlines <- tibble(context = c("CG", "CHG", "CHH"),
+                  threshold = c(0.5, 0.5, 0.3))
+
+ggplot(tb_dmrs_chosen_params %>% filter(cytosinesCount >= 4), aes(x = (proportion2 - proportion1), y = pValue)) +
+  facet_grid(cols = vars(sample), rows = vars(context)) +
+  geom_vline(data = vlines, aes(xintercept = threshold),  color = "dodgerblue3") +
+  geom_vline(data = vlines, aes(xintercept = -threshold), color = "dodgerblue3") +
+  geom_hline(yintercept = 0.01, color = "dodgerblue3") +
+  geom_point(shape = 16, size = 0.4, alpha = 0.3) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_width(0.4), labels = label_percent(), name = "%mC - WT %mC") +
+  scale_y_continuous(trans = reverselog_trans(10), limits = c(1, 1e-20),
+                     breaks = breaks_log(n = 6),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  labs(title = "Volcano plot of DMRs (decided parameters)",
+       subtitle = "for chromosome 6 of tomato (47 Mbp)\nCG & CHG: Noise filter method, mpd = 0.5\nCHH: Bins method, mpd = 0.3") +
+   theme(strip.background = element_rect(colour = NA, fill = "lightskyblue1"),
+        panel.border = element_rect(colour = "black", linewidth =1), axis.line = element_blank())
+ggsave("../figures/ch06-test/volcano-plot-DMRs-ch06-selected-parameters-2023-09-by-filter.pdf", width = 6, height = 7)
+```
+
+## 3.3 Expected numbers whole genome
+
+Here I calculate the expected number of DMRs for the whole genome by multiplying the number of DMRs in ch06 by 17 times:
+
+```{r}
+stats_dmrs_selected %>% 
+  mutate(DMRs_whole_genome = 17 * DMRs,
+         length_whole_genome = 17 * length)
+```
+

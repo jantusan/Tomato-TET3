@@ -1,0 +1,1064 @@
+---
+title: "DEGs"
+subtitle: "_Tomato TET3 RNA-seq_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r libraries-and-functions, include=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(ComplexHeatmap)
+ht_opt$message = FALSE
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(gprofiler2)
+library(kableExtra)
+library(shadowtext)
+library(ggbeeswarm)
+library(scales)
+library(tidyHeatmap)
+library(ggpubr)     # gives stat_compare_means() & stat_pvalue_manual()
+library(rstatix)    # tidy anova_test() & tukey_hsd()
+
+deg_cts = function(res, cts, ...) {
+  res %>%
+    #as_tibble(rownames = "id") %>%
+    inner_join(cts, by = "id") %>%
+    filter(...)
+}
+
+# Wrapper for enhancedVolcano
+enhanced_volcano <- function(res, lab = NA, xlim = c(-5, 5), ylim = c(0, 12.5), pCutoff = 0.01, FCcutoff = 1, 
+                             sample = "", reference = "", n_degs = filter(res, padj < pCutoff, abs(log2FoldChange) > FCcutoff) %>% nrow(),
+                             comparison = str_c(sample, " vs ", reference),
+                             title = str_c(comparison, " (" , n_degs, " DEXs)"), caption = FALSE,
+                             label.x = 3.75, label.y = 9, size.title = 20, size.label = size.title / 3, ...) {
+  
+  n_degs_down <- filter(res, padj < pCutoff, log2FoldChange < -FCcutoff) %>% nrow()
+  n_degs_up   <- filter(res, padj < pCutoff, log2FoldChange >  FCcutoff) %>% nrow()
+  
+  EnhancedVolcano(res, lab = lab, x = 'log2FoldChange', y = 'padj', xlim = xlim, ylim = ylim, pCutoff = pCutoff, FCcutoff = FCcutoff, shape = 16, 
+                  title = title, subtitle = NULL, caption = if(caption) paste0("total = ", nrow(res), " elements"), titleLabSize = size.title, ... = ...) +
+    annotate("text", x = -label.x, y = label.y, label = paste(n_degs_down, "down"), size = size.label) +
+    annotate("text", x =  label.x, y = label.y, label = paste(n_degs_up,     "up"),  size = size.label)
+}
+```
+
+```{r load-objects}
+sample_table <- readRDS("../data/4_counts/TEcounts/sample_table_TEcounts.RDS") %>% 
+  separate(description, sep = " ", into = c("line", "genotype"), remove = FALSE, fill = "right") %>% 
+  replace_na(list(genotype = "")) %>% 
+  mutate(line = fct_inorder(line),
+         genotype = fct_inorder(genotype))
+
+dds <- readRDS("../data/4_counts/TEcounts/TEcounts_dds.rds")
+cts  <- read_tsv("../data/4_counts/TEcounts/TEcounts_normalised.tsv", show_col_types = FALSE)
+vsd  <- read_tsv("../data/4_counts/TEcounts/TEcounts_vsd.tsv", show_col_types = FALSE)
+```
+
+```{r aesthetic-variables}
+sample_colors      <- c(WT    = "grey40",          TET3  = "tomato2",       NTS = "slateblue2")
+description_colors <- c("WT"  = "grey40", "A.T1 TET3"  = "tomato2", "A.T1 NT" = "slateblue2")
+```
+
+### DEGs
+
+Get the statistics for each of the comparisons in a list
+```{r}
+res = list(
+  TET3_vs_WT  = results(dds, contrast=c("condition", "TET3",  "WT")) %>% as_tibble(rownames = "id"),
+  NTS_vs_WT = results(dds, contrast=c("condition", "NTS", "WT")) %>% as_tibble(rownames = "id"),
+  NTS_vs_TET3 = results(dds, contrast=c("condition", "NTS", "TET3")) %>% as_tibble(rownames = "id")
+)
+
+res_genes <- map(res, ~ filter(.x,  str_starts(id, "gene")))
+res_TEs   <- map(res, ~ filter(.x, !str_starts(id, "gene")))
+```
+
+get the counts for the DEGs (also as a list)
+```{r}
+DEGs_cts <- map(res, ~ deg_cts(.x, cts))
+```
+
+get the variance stabilized counts for the DEGs (also as a list)
+```{r}
+DEGs_vsd <- map(res, ~ deg_cts(.x, vsd))
+```
+
+Join all DEGs with its counts in a unique table
+```{r}
+DEGs_vsd_df <- DEGs_vsd %>%
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison), 
+         element = case_when(str_starts(id, "gene") ~ "gene",
+                             !str_starts(id, "gene") ~ "TE")) %>% 
+  relocate(element, .after = id)
+```
+
+Filter and keep the list structure
+
+```{r}
+DEGs_vsd_p01_lfc1 <- map(DEGs_vsd, ~ filter(., padj < 0.01, abs(log2FoldChange) > 1) %>% 
+                           mutate(element = case_when(str_starts(id, "gene") ~ "gene",
+                                                      !str_starts(id, "gene") ~ "TE")) %>% 
+                           relocate(element, .after = id))
+
+DEGs_vsd_p05_lfc1 <- map(DEGs_vsd, ~ filter(., padj < 0.05, abs(log2FoldChange) > 1) %>% 
+                           mutate(element = case_when(str_starts(id, "gene") ~ "gene",
+                                                      !str_starts(id, "gene") ~ "TE")) %>% 
+                           relocate(element, .after = id))
+```
+
+Write the DEGs to a Excel file with tabs for each comparison
+
+```{r}
+dir.create("../data/6_degs/TEcounts/", showWarnings = FALSE)
+writexl::write_xlsx(DEGs_vsd_p01_lfc1, path = "../data/6_degs/TEcounts/DEGs_p01_lfc1_with_vsd.xlsx")
+writexl::write_xlsx(DEGs_vsd_p05_lfc1, path = "../data/6_degs/TEcounts/DEGs_p05_lfc1_with_vsd.xlsx")
+```
+
+And save it as a RDS object for easy loading
+
+```{r}
+write_rds(DEGs_vsd_p01_lfc1, file = "../data/6_degs/TEcounts/DEGs-p01.rds")
+write_rds(DEGs_vsd_p01_lfc1, file = "../data/6_degs/TEcounts/DEGs-p05.rds")
+```
+
+### DEGs number
+
+```{r fig.height=5, fig.width=5}
+DEGs_vsd_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 1) %>% 
+  group_by(comparison, element,  log2FoldChange > 0) %>%
+  dplyr::count(comparison) %>%
+  rename(kind = `log2FoldChange > 0`, DEGs = n) %>%
+  mutate(kind = case_when(kind == TRUE ~ "up",
+                          kind == FALSE ~ "down"),
+         group = case_when(str_detect(comparison, "WT") ~ "A.T1\n vs WT",
+                           .default = "between\nA.T1") %>% 
+           factor(levels = c("A.T1\n vs WT", "between\nA.T1")),
+         comparison = str_replace(comparison, "TET3", "A.T1 TET3") %>% 
+           str_replace("NTS", "A.T1 NT") %>% 
+           str_replace_all("_", "\n")) %>%
+  ggplot(aes(comparison, DEGs, fill = kind, label = DEGs)) +
+  facet_grid(cols = vars(group), rows = vars(element), scales = "free", space = "free_x") +
+  geom_col(position = "stack", color = 1, alpha = 0.7) +
+  geom_shadowtext(position = "stack", color = "white", check_overlap = TRUE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Number of DEGs",
+       subtitle = "p.adj < 0.01 & |logFC| > 1",
+       caption = "Tomato TET3 RNA-seq") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.line=element_blank(), axis.ticks.x = element_blank(), 
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        legend.position = "top", legend.direction = "horizontal",
+        strip.background = element_rect(fill = "pink"))
+
+ggsave("../figures/TEcounts/DEGs_number.pdf", width = 5, height = 5)
+```
+
+```{r}
+comparison_colors  <- c("NTS\nvs\nWT"         = "slateblue2", 
+                        "TET3\nvs\nWT"       = "tomato2", 
+                        "NTS\nvs\nTET3"  = "goldenrod2")
+
+DEG_numbers <- DEGs_vsd_p01_lfc1 %>% 
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison)) %>% 
+  group_by(comparison, element, log2FoldChange > 0) %>%
+  dplyr::count(comparison) %>%
+  rename(kind = `log2FoldChange > 0`, DEGs = n) %>%
+  mutate(kind = case_when(kind == TRUE ~ "up",
+                          kind == FALSE ~ "down"),
+         comparison = str_replace(comparison, "A4", "A.T1 TET3") %>% 
+           str_replace("A17", "A.T1 NT") %>% 
+           str_replace_all("_", "\n"))
+```
+
+```{r}
+ggplot(DEG_numbers %>% filter(kind == "down", element == "gene"), 
+       aes(x = DEGs, y = comparison, fill = comparison, label = DEGs)) +
+  facet_grid(cols = vars(kind), switch = "y") +
+  geom_col() +
+  #geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  geom_text(position = position_stack(vjust = 0.5)) +
+  scale_y_discrete(position = "right") +
+  scale_x_reverse(expand = expansion(mult = c(0.05, 0))) +
+  scale_fill_manual(values = comparison_colors) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA)) +
+  
+  ggplot(DEG_numbers %>% filter(kind == "up", element == "gene"), 
+       aes(x = DEGs, y = comparison, fill = comparison, label = DEGs)) +
+  facet_grid(cols = vars(kind), switch = "y") +
+  geom_col() +
+  #geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  geom_text(position = position_stack(vjust = 0.5)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = comparison_colors) +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA)) +
+  
+  plot_annotation(title = "Differentially Expressed Genes (DEGs)",
+                  subtitle = "p.adj < 0.01 & |logFC| > 1") +
+  plot_layout(widths = c(1.2, 4))
+
+ggsave2("../figures/TEcounts/colplot-DEGs-Figure-4B.pdf", width = 190, height = 100, units = "mm")
+```
+
+```{r}
+ggplot(DEG_numbers %>% filter(kind == "down", element == "TE"), 
+       aes(x = DEGs, y = comparison, fill = comparison, label = DEGs)) +
+  facet_grid(cols = vars(kind), switch = "y")+ #, scale = "free", space = "free") +
+  geom_col() +
+  #geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  geom_text(position = position_stack(vjust = 0.5)) +
+  scale_y_discrete(position = "right") +
+  scale_x_reverse(expand = expansion(mult = c(0.05, 0))) +
+  scale_fill_manual(values = comparison_colors) +
+   labs(x = "DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA)) +
+  
+  ggplot(DEG_numbers %>% filter(kind == "up", element == "TE"), 
+       aes(x = DEGs, y = comparison, fill = comparison, label = DEGs)) +
+  facet_grid(cols = vars(kind), switch = "y") +
+  geom_col() +
+  #geom_shadowtext(position = position_stack(vjust = 0.5), color = "white") +
+  geom_text(position = position_stack(vjust = 0.5)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = comparison_colors) +
+   labs(x = "DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"),legend.position= "none",
+        axis.ticks.y = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA)) +
+  
+  plot_annotation(title = "Differentially Expressed TEs (DETEs)",
+                  subtitle = "p.adj < 0.01 & |logFC| > 1") +
+  plot_layout(widths = c(6,4))
+
+ggsave2("../figures/TEcounts/colplot-DETEs-Figure-4B.pdf", width = 190, height = 100, units = "mm")
+```
+
+### Volcano plots {.tabset}
+
+Using enhanced volcano
+
+#### Zoom out
+
+```{r fig.width=10,  fig.height=16}
+(volcanos <- enhanced_volcano(res_genes$TET3_vs_WT,  sample = "TET3", reference = "WT: Genes", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60) +
+             enhanced_volcano(res_TEs$TET3_vs_WT,    sample = "TET3", reference = "WT", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60) +
+             enhanced_volcano(res_genes$NTS_vs_WT, sample = "NTS",  reference = "WT", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60) +
+             enhanced_volcano(res_TEs$NTS_vs_WT, sample = "NTS",  reference = "WT", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60) +
+             enhanced_volcano(res_genes$NTS_vs_TET3, sample = "NTS", reference = "NTS", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60, caption = TRUE) +
+             enhanced_volcano(res_TEs$NTS_vs_TET3, sample = "NTS", reference = "NTS", xlim = c(-9, 9), ylim = c(0, 110), label.x = 5, label.y = 60, caption = TRUE) +
+  plot_layout(nrow = 3, guides = 'collect') &  theme(legend.position = 'top'))
+
+ggsave(filename = "../figures/TEcounts/volcano_plots_all.pdf", plot = volcanos, width = 10, height = 16)
+```
+
+#### Zoom in
+
+```{r fig.width=10,  fig.height=16}
+(volcanos <- enhanced_volcano(res_genes$TET3_vs_WT,  sample = "TET3", reference = "WT") +
+             enhanced_volcano(res_TEs$TET3_vs_WT,    sample = "TET3", reference = "WT") +
+             enhanced_volcano(res_genes$NTS_vs_WT, sample = "NTS",  reference = "WT") +
+             enhanced_volcano(res_TEs$NTS_vs_WT, sample = "NTS",  reference = "WT") +
+             enhanced_volcano(res_genes$NTS_vs_TET3, sample = "NTS", reference = "NTS", caption = TRUE) +
+             enhanced_volcano(res_TEs$NTS_vs_TET3, sample = "NTS", reference = "NTS", caption = TRUE) +
+  plot_layout(nrow = 3, guides = 'collect') &  theme(legend.position = 'top'))
+
+ggsave(filename = "../figures/TEcounts/volcano_plots_zoom.pdf", plot = volcanos, width = 10, height = 16)
+```
+
+#### For figures
+
+```{r fig.width=8,  fig.height=4}
+volcano_figure <- function(res, sample, reference) {
+  enhanced_volcano(res, sample = sample, reference = reference,  xlim = c(-10, 10), ylim = c(0, 20), label.x = 5, label.y = 20, 
+                   title = str_c(sample, " vs ", reference), caption = FALSE, size.label = 6,
+                   lab = res$id %>%  str_remove_all(".*[[:digit:]\\)]:") %>% str_remove_all(":LTR"), 
+                 #col = c("grey30", "grey30", "grey30", "red2"),
+                 pointSize = 2,
+                 labSize = 4,
+                 labCol = "black",
+                 labFace = "plain",
+                 boxedLabels = FALSE,
+                 parseLabels = FALSE,
+                 drawConnectors = TRUE,
+                 #drawConnectors = FALSE,
+                 widthConnectors = 0.5,
+                 typeConnectors = "open",
+                 endsConnectors = "first",
+                 lengthConnectors = unit(0.01, "npc"),
+                 colConnectors = "grey10",
+                 max.overlaps = 17,
+                 maxoverlapsConnectors = NULL,
+                 min.segment.length = 0,
+                 directionConnectors = "both",
+                 arrowheads = TRUE,
+                 ) +
+  theme_cowplot() +
+  theme(legend.position = "none")
+}
+
+volcano_figure(res_TEs$TET3_vs_WT, sample = "TET3", reference = "WT") +
+  volcano_figure(res_TEs$NTS_vs_WT, sample = "NTS", reference = "WT")
+  
+ggsave2("../figures/TEcounts/volcano_plots_figure-4A-.pdf", width = 200, height = 100, unit = "mm")
+```
+
+
+```{r fig.width=8,  fig.height=4}
+volcano_figure(res_TEs$NTS_vs_TET3, sample = "NTS", reference = "TET3")
+  
+ggsave2("../figures/TEcounts/volcano_plots_figure-supp.pdf", width = 100, height = 100, unit = "mm")
+```
+
+#### Coloring by TE type
+
+```{r fig.width=12,  fig.height=4}
+volcano_grouping <- function(res, sample, reference) {
+  
+  keyvals <- case_when(str_detect(res$id, "DNA") ~ 17,
+                       str_detect(res$id, "LTR") ~ 18,
+                       .default = 16)
+  keyvals[is.na(keyvals)] <- 16
+  names(keyvals)[keyvals == 17] <- 'dna'
+  names(keyvals)[keyvals == 18] <- 'ltr'
+  names(keyvals)[keyvals == 16] <- 'other'
+  
+  keyvals <- case_when(str_detect(res$id, "DNA") ~ "red",
+                       str_detect(res$id, "LTR") ~ "royalblue",
+                       .default = "green3")
+  keyvals[is.na(keyvals)] <- 16
+  names(keyvals)[keyvals == "red"] <- 'DNA'
+  names(keyvals)[keyvals == "royalblue"] <- 'LTR'
+  names(keyvals)[keyvals == "green3"] <- 'other'
+  
+  enhanced_volcano(res, sample = sample, reference = reference,  xlim = c(-10, 10), ylim = c(0, 20), label.x = 5, label.y = 20, 
+                   title = str_c(sample, " vs ", reference), caption = FALSE, size.label = 6,
+                   lab = res$id %>%  str_remove_all(".*[[:digit:]\\)]:") %>% str_remove_all(":LTR"), 
+                 #col = c("grey30", "grey30", "grey30", "red2"),
+                 pointSize = 2,
+                 #shapeCustom = keyvals,
+                 colCustom = keyvals,
+                 col = c("grey30", "forestgreen", "royalblue", "red2"),labSize = 4,
+                 labCol = "black",
+                 labFace = "plain",
+                 boxedLabels = FALSE,
+                 parseLabels = FALSE,
+                 drawConnectors = TRUE,
+                 #drawConnectors = FALSE,
+                 widthConnectors = 0.5,
+                 typeConnectors = "open",
+                 endsConnectors = "first",
+                 lengthConnectors = unit(0.01, "npc"),
+                 colConnectors = "grey10",
+                 max.overlaps = 15,
+                 maxoverlapsConnectors = NULL,
+                 min.segment.length = 0.4,
+                 directionConnectors = "both",
+                 arrowheads = TRUE,
+                 ) +
+  theme_cowplot() +
+  theme(legend.position = "right")
+}
+
+
+
+volcano_grouping(res_TEs$TET3_vs_WT, sample = "TET3", reference = "WT") +
+  volcano_grouping(res_TEs$NTS_vs_WT, sample = "NTS", reference = "WT") +
+  plot_layout(guides = "collect")
+  
+ggsave2("../figures/TEcounts/volcano_plots_figure-4A-colors.pdf", width = 250, height = 100, unit = "mm")
+```
+
+```{r fig.width=8,  fig.height=4}
+volcano_grouping(res_TEs$NTS_vs_TET3, sample = "NTS", reference = "TET3")
+  
+ggsave2("../figures/TEcounts/volcano_plots_figure-supp-colors.pdf", width = 160, height = 100, unit = "mm")
+```
+
+
+### Comparison of DEGs with different thresholds
+
+```{r fig.height=7, fig.width=11}
+visualise_degs <- function(DEGs_vsd_df, padj_lim, lfc_lim, fill = bin_padj) {
+  DEGs_vsd_df %>%
+    filter(padj <= padj_lim, abs(log2FoldChange) > lfc_lim, element == "TE") %>%
+    mutate(rank = ntile(padj, 10), 
+           logpadj = -log10(padj),
+           bin_padj = cut(padj, c(1, 0.5, 0.1, 0.05, 0.01, 0.001, 0.0001, 0)),
+           bin_padj = fct_reorder(bin_padj, -padj),
+           bin_l2fc = cut(log2FoldChange, c(-Inf, -10, -4, -2, -1, -0.5, 0, 0.5, 1, 2, 4, 10, Inf)),
+           bin_l2fc = fct_reorder(bin_l2fc, log2FoldChange),
+           bin_absl2fc = cut(abs(log2FoldChange), c(0, 0.5, 1, 2, 4, 10, Inf)),
+           bin_absl2fc = fct_reorder(bin_absl2fc, abs(log2FoldChange))) %>%
+    group_by(comparison, {{ fill }}) %>%
+    summarise(count = n(), .groups = 'drop') %>%
+    ggplot(aes(x = count, y = comparison, fill = {{ fill }})) +
+    geom_col(color = NA) +
+    ggtitle(str_c("DETEs with a p-adj <= ", padj_lim, " & abs(log2FC) > ", lfc_lim)) +
+    scale_fill_viridis_d(direction = -1, option = if_else(deparse(substitute(fill)) == "bin_padj" , "plasma", "viridis")) +
+    #scale_fill_distiller(palette = 2)
+    scale_y_discrete(limits = rev)
+}
+
+deg_pv <- visualise_degs(DEGs_vsd_df, padj_lim = 0.05, lfc_lim = 1, fill = bin_padj)
+deg_fc <- visualise_degs(DEGs_vsd_df, padj_lim = 0.05, lfc_lim = 1, fill = bin_absl2fc)
+
+all_pv <- visualise_degs(DEGs_vsd_df, padj_lim = 1, lfc_lim = 0, fill = bin_padj)
+all_fc <- visualise_degs(DEGs_vsd_df, padj_lim = 1, lfc_lim = 0, fill = bin_absl2fc)
+
+(DEGs_padj_l2fc <- (all_pv + all_fc + deg_pv + deg_fc))
+ggsave2("../figures/TEcounts/DETEs_padj_l2fc.pdf", width = 11, height = 7)
+```
+
+### Heatmaps
+
+```{r}
+deg_mat = function(res, cts, ..., scaled = FALSE) {
+  deg_cts(res, cts, ...) %>% # ...) %>%
+    column_to_rownames("id") %>%
+    select(-c(baseMean:padj)) %>%
+    rename_with(~ .x %>% toupper() %>% str_replace_all("_", " ")) %>%
+    as.matrix() %>%
+    {if(scaled) {t(.) %>% scale() %>% t()}
+      else .}
+}
+
+hm_wrapper = function(mat, scaled = F, cluster_rows = T, cluster_columns = T, title = "") {
+  if(scaled) {col = rev(brewer.pal(9, "RdBu"));  name = "scaled\nexpression"}
+  else       {col =     brewer.pal(9, "YlOrRd"); name = "expression"}
+  Heatmap(mat, cluster_rows = cluster_rows, cluster_columns = cluster_columns, show_row_names = F, col = col, name = name, column_title = title)
+}
+
+deg_hm = function(res, cts, ..., scaled = F, file = F, title = NULL) {
+  mat = deg_mat(res = res, cts = cts, ... = ..., scaled = scaled)
+  if (file != 0) {
+    pdf(file, height = 5, width = 5)
+      hm <- hm_wrapper(mat, scaled = scaled)
+      draw(hm, column_title = paste(nrow(mat), title, "DEGs", deparse(substitute(...))))
+    dev.off()
+  } else {
+    hm_wrapper(mat, scaled = scaled, title = title)
+  }
+}
+
+cts_log <- cts %>% mutate(across(-id, ~ log10(.x + 1)))
+```
+
+#### Scaled first
+
+```{r}
+hms_TET3 <- deg_hm(res_TEs$TET3_vs_WT,   vsd,                padj < 0.01, abs(log2FoldChange) > 1, title = "TET3 DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$TET3_vs_WT, vsd %>% select(id, WT_1:TET3_2), padj < 0.01, abs(log2FoldChange) > 1, title = "TET3 only", scaled = TRUE) +
+  deg_hm(res_TEs$TET3_vs_WT, cts_log,                         padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE) 
+
+hms_NTS <- deg_hm(res_TEs$NTS_vs_WT,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "NTS DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_WT, vsd %>% select(id, WT_1:WT_2, NTS_1:NTS_2), padj < 0.01, abs(log2FoldChange) > 1, title = "NTS only", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_WT, cts_log,                                    padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE)
+
+hms_sibs <- deg_hm(res_TEs$NTS_vs_TET3,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "sibs DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_TET3, vsd %>% select(id, WT_1:WT_2, NTS_1:NTS_2), padj < 0.01, abs(log2FoldChange) > 1, title = "sibs only", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_TET3, cts_log,                                    padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE)
+```
+
+```{r}
+pdf(file = "../figures/TEcounts/heatmap_DETEs_all.pdf", height = 12, width = 7) 
+grid.newpage()
+pushViewport(viewport(x = 0, y = 1, height = 0.3333, just = c("left", "top")))
+draw(hms_TET3, newpage = FALSE, column_title = "33 TET3 DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.6666, height = 0.3333, just = c("left", "top")))
+draw(hms_NTS, newpage = FALSE, column_title = "40 NTS DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.3333, height = 0.3333, just = c("left", "top")))
+draw(hms_sibs, newpage = FALSE, column_title = "46 siblings DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+dev.off()
+```
+
+#### Raw first
+
+```{r}
+hms_TET3 <- deg_hm(res_TEs$TET3_vs_WT, cts_log,                          padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE)  +
+  deg_hm(res_TEs$TET3_vs_WT,   vsd,                padj < 0.01, abs(log2FoldChange) > 1, title = "TET3 DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$TET3_vs_WT, vsd %>% select(id, WT_1:TET3_2), padj < 0.01, abs(log2FoldChange) > 1, title = "TET3 only", scaled = TRUE)
+
+hms_NTS <- deg_hm(res_TEs$NTS_vs_WT, cts_log,                                       padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE) +
+  deg_hm(res_TEs$NTS_vs_WT,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "NTS DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_WT, vsd %>% select(id, WT_1:WT_2, NTS_1:NTS_2), padj < 0.01, abs(log2FoldChange) > 1, title = "NTS only", scaled = TRUE)
+
+hms_sibs <- deg_hm(res_TEs$NTS_vs_TET3, cts_log,                                    padj < 0.01, abs(log2FoldChange) > 1, title = "log10(counts + 1)", scaled = FALSE) +
+  deg_hm(res_TEs$NTS_vs_TET3,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "sibs DEGs", scaled = TRUE) +
+  deg_hm(res_TEs$NTS_vs_TET3, vsd %>% select(id, WT_1:WT_2, NTS_1:NTS_2), padj < 0.01, abs(log2FoldChange) > 1, title = "sibs only", scaled = TRUE)
+```
+
+```{r}
+pdf(file = "../figures/TEcounts/heatmap_DETEs_all-unscaled.pdf", height = 12, width = 7) 
+grid.newpage()
+pushViewport(viewport(x = 0, y = 1, height = 0.3333, just = c("left", "top")))
+draw(hms_TET3, newpage = FALSE, column_title = "33 TET3 DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.6666, height = 0.3333, just = c("left", "top")))
+draw(hms_NTS, newpage = FALSE, column_title = "40 NTS DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.3333, height = 0.3333, just = c("left", "top")))
+draw(hms_sibs, newpage = FALSE, column_title = "46 siblings DETEs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+dev.off()
+```
+
+## Tidy Heatmaps 
+
+```{r}
+# color ramp from a Brewer palette
+brewer.ramp <- function(start, end, pal) {
+  palette = RColorBrewer::brewer.pal(n = RColorBrewer::brewer.pal.info[pal, "maxcolors"],  name = pal)
+  sequence = seq(start, end, (end - start)/(RColorBrewer::brewer.pal.info[pal, "maxcolors"] - 1))
+  ramp = circlize::colorRamp2(sequence, palette)
+  return(ramp)
+}
+
+# Function that takes a tibble of combined DMR comparisons and returns a long table
+filter_degs_and_pivot <- function(tb_degs, comp) {
+  tb_degs %>% 
+    filter(comparison == comp)  %>% 
+    pivot_longer(cols = -c(comparison:padj), values_to = "counts", names_to = "sample") %>% 
+    mutate(condition = str_remove(sample, "_.$") %>% fct_inorder()) %>% 
+    # scale expression
+    group_by(id) %>% 
+    mutate(scaled = scale(counts) %>% as.numeric()) %>% 
+    ungroup()
+}
+
+#Function that takes a ComplexHeatmap list and makes it work with Patchwork syntax
+wrap_heatmap_list <- function(heatmap_list, draw = FALSE) {
+  heatmap_list %>% 
+    {if (draw) ComplexHeatmap::draw(.) else .} %>%
+    grid::grid.grabExpr() %>% 
+    patchwork::wrap_elements()
+}
+
+# function to plot heatmaps
+heatmap_degs <- function(tb_degs_long, show_legends = TRUE, title = character(0), max_n = Inf, 
+                         top_tile_variable = condition, top_tile_colors = condition_colors_2,
+                         use_raster = TRUE, show_row_names = FALSE) {
+  
+  n_degs = unique(tb_degs_long$id) %>% length()
+  
+  tb_degs_long_sample <- tb_degs_long %>% 
+    group_by(kind) %>% 
+    mutate(genotype = condition) 
+  #mutate(genotype = {{ top_tile_variable }})
+  
+  heatmap(tb_degs_long_sample, .row = id, .column = sample, .value = scaled, 
+          cluster_columns = TRUE, show_row_names = FALSE, use_raster = use_raster, 
+          palette_value = color_ramp_scaled, name = "scaled", 
+          palette_grouping = list(c("firebrick3", "dodgerblue3")), use_raster = TRUE,
+          row_title = NULL, column_title = NULL, width = unit(4, "cm"),
+          show_row_names = show_row_names) %>% 
+    annotation_tile(genotype, palette = top_tile_colors, show_annotation_name = FALSE, size = unit(0.3, "cm")) %>% 
+    annotation_tile(log2FC, palette = color_ramp_l2fc, annotation_name_side = "top", size = unit(0.7, "cm")) %>% 
+    as_ComplexHeatmap() %>% 
+    draw(row_title = str_c(title, " (n=" , n_degs, ")"), merge_legend = TRUE, 
+         show_heatmap_legend = show_legends, show_annotation_legend = show_legends) %>% 
+    wrap_heatmap_list(draw = FALSE)
+}
+```
+
+```{r}
+tb_degs <- DEGs_vsd_p01_lfc1 %>% 
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison)) %>% 
+  rename(log2FC = log2FoldChange) %>% 
+  mutate(kind = case_when(log2FC > 0 ~ "up",
+                          log2FC < 0 ~ "down")) %>% 
+  relocate(kind, .after = log2FC)
+
+color_ramp_l2fc  <- brewer.ramp(5, -5, "Spectral")
+color_ramp_scaled   <- brewer.ramp(2, -2, "RdBu")
+
+condition_colors_2 <- c("WT"  = "grey40", "TET3"  = "tomato2", "NT" = "slateblue2") %>% 
+  fct_inorder()
+```
+
+```{r fig.width=10, fig.height=12}
+tb_degs %>% 
+  filter(element == "gene") %>% 
+  filter_degs_and_pivot(comp = "TET3_vs_WT") %>% 
+  heatmap_degs(title = "TET3 vs WT: Genes", show_legends = FALSE) +
+  
+  tb_degs %>% 
+  filter(element == "gene") %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_WT") %>% 
+  heatmap_degs(title = "NTS vs WT: Genes", show_legends = FALSE) +
+  
+  tb_degs %>% 
+  filter(element == "gene") %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_TET3") %>% 
+  heatmap_degs(title = "NTS vs TET3: Genes") +
+  
+  tb_degs %>% 
+  filter(element == "TE") %>% 
+  filter_degs_and_pivot(comp = "TET3_vs_WT") %>% 
+  heatmap_degs(title = "TET3 vs WT: TEs", show_legends = FALSE) +
+  
+  tb_degs %>% 
+  filter(element == "TE") %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_WT") %>% 
+  heatmap_degs(title = "NTS vs WT: TEs", show_legends = FALSE) +
+  
+  tb_degs %>% 
+  filter(element == "TE") %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_TET3") %>% 
+  heatmap_degs(title = "NTS vs TET3: TEs") +
+  
+  plot_layout(nrow = 2, widths = c(8.5, 8.5, 11))
+  
+ggsave2("../figures/TEcounts/heatmaps-DEGs-Figure-4C.pdf", width = 250, height = 300, units = "mm")
+```
+
+TEs with names
+
+```{r fig.width=14, fig.height=9}
+tb_degs %>% 
+  filter(element == "TE") %>% 
+  mutate(id = str_remove(id, "rnd-._family-") %>% str_replace_all(":", "  ")) %>% 
+  filter_degs_and_pivot(comp = "TET3_vs_WT") %>% 
+  heatmap_degs(title = "TET3 vs WT: TEs", show_legends = FALSE, show_row_names = TRUE) +
+  
+  tb_degs %>% 
+  filter(element == "TE") %>% 
+  mutate(id = str_remove(id, "rnd-._family-") %>% str_replace_all(":", "  ")) %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_WT") %>% 
+  heatmap_degs(title = "NTS vs WT: TEs", show_legends = FALSE, show_row_names = TRUE) +
+  
+  tb_degs %>% 
+  filter(element == "TE") %>% 
+  mutate(id = str_remove(id, "rnd-._family-") %>% str_replace_all(":", "  ")) %>% 
+  filter_degs_and_pivot(comp = "NTS_vs_TET3") %>% 
+  heatmap_degs(title = "NTS vs TET3: TEs", show_row_names = TRUE) +
+  
+  plot_layout(nrow = 1, widths = c(8.5, 8.5, 11))
+  
+ggsave2("../figures/TEcounts/heatmaps-DETEs-with-names.pdf", width = 14, height = 9)
+```
+
+## Boxplots of expression by direction
+
+### vsd 
+
+```{r}
+degs_tes_vsd_long <- tb_degs %>% 
+  filter(element == "TE") %>% 
+  pivot_longer(WT_1:NTS_2, names_to = "sample", values_to = "expression") %>% 
+  mutate(sample = str_replace(sample, "_", " ") %>%  fct_inorder(),
+         condition = str_remove(sample, " ."))
+```
+
+```{r, fig.width=4, fig.height=3}
+degs_tes_vsd_long %>% 
+  filter(comparison == "TET3_vs_WT") %>% 
+  ggplot(aes(x = sample, y = expression, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  labs(subtitle = "TET3 vs WT") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+```
+
+```{r, fig.width=4, fig.height=3}
+degs_tes_vsd_long %>% 
+  filter(comparison == "NTS_vs_WT") %>% 
+  ggplot(aes(x = sample, y = expression, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  labs(subtitle = "NTS vs WT") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+```
+
+```{r, fig.width=4, fig.height=3}
+degs_tes_vsd_long %>% 
+  filter(comparison == "NTS_vs_TET3") %>% 
+  ggplot(aes(x = sample, y = expression, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  labs(subtitle = "NTS vs TET3") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+```
+
+### cts (log scale)
+
+```{r}
+degs_tes_cts_long <- map(DEGs_cts, ~ filter(., padj < 0.01, abs(log2FoldChange) > 1) %>% 
+      mutate(element = case_when(str_starts(id, "gene") ~ "gene",
+                                 !str_starts(id, "gene") ~ "TE")) %>% 
+      relocate(element, .after = id)) %>% 
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison)) %>% 
+  rename(log2FC = log2FoldChange) %>% 
+  mutate(kind = case_when(log2FC > 0 ~ "up",
+                          log2FC < 0 ~ "down")) %>% 
+  relocate(kind, .after = log2FC) %>% 
+  filter(element == "TE") %>% 
+  pivot_longer(WT_1:NTS_2, names_to = "sample", values_to = "cts") %>% 
+  mutate(sample = str_replace(sample, "_", " ") %>%  fct_inorder(),
+         condition = str_remove(sample, " ."),
+         log_cts = log10(1 + cts))
+```
+
+```{r, fig.width=4, fig.height=3}
+degs_tes_cts_long %>% 
+  filter(comparison == "TET3_vs_WT") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "TET3 vs WT DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+
+ggsave2("../figures/TEcounts/boxplots-counts-DEGs-TET3_Figure4B.pdf",width = 100, height = 100, unit = "mm")
+```
+
+```{r, fig.width=8, fig.height=3}
+degs_tes_cts_long %>% 
+  filter(comparison == "NTS_vs_WT") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "NTS vs WT DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank()) +
+degs_tes_cts_long %>% 
+  filter(comparison == "NTS_vs_TET3") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "NTS vs TET3 DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank())
+
+ggsave2("../figures/TEcounts/boxplots-counts-DEGs-NTS_Fig-Supp.pdf",width = 200, height = 100, unit = "mm")
+```
+
+### cts (log scale) with stats
+
+Run one-way ANOVA separately for each comparison in up & down
+
+```{r}
+degs_tes_cts_long %>%
+  group_by(comparison, kind) %>%                       
+  anova_test(log_cts ~ sample) %>%
+  get_anova_table()
+```
+
+Function to get letters (CLD) from a Tukey test
+
+```{r}
+# get_letters.R ------------------------------------------------------------
+# Pipe‑friendly helper to create compact‑letter displays (CLDs)
+# from a tidy Tukey HSD result (e.g. rstatix::tukey_hsd() output).
+#
+# Author : ChatGPT (OpenAI)
+# Date   : 2025‑07‑21
+# -----------------------------------------------------------------------------
+#' get_letters
+#'
+#' Quickly derive compact‑letter displays (CLDs) from a tidy Tukey‑HSD table.
+#'
+#' This is a %>%‑friendly wrapper around **multcompView::multcompLetters()**
+#' that plays nicely with the tidy output produced by
+#' `rstatix::tukey_hsd()` or any tibble that contains at least three
+#' columns: the first group, the second group, and the adjusted p‑value.
+#'
+#' If your Tukey table contains extra grouping/facetting columns
+#' (e.g. `kind == "up"/"down"`), pass their unquoted names via `by`.
+#'
+#' @param data    A data.frame/tibble with pairwise comparisons.
+#' @param p_col   Name of the column that stores adjusted p‑values.
+#' @param group1  Name of the first group column.
+#' @param group2  Name of the second group column.
+#' @param by      Optional tidy‑select of columns to treat as grouping
+#'                variables (facets).  Default = NULL.
+#' @param threshold Significance threshold for grouping letters (default 0.05).
+#' @param sample_levels Optional character vector giving the order of levels
+#'                in the output; falls back to sorted union of group names.
+#'
+#' @return A tibble with columns `sample` and `letter`, plus any columns
+#'         listed in `by`, suitable to join back to your original data
+#'         or feed straight into `geom_text()`.
+#'
+#' @examples
+#' # Example with the built‑in PlantGrowth data ---------------------------
+#' if (requireNamespace("rstatix", quietly = TRUE)) {
+#'   library(dplyr)
+#'   library(rstatix)
+#'
+#'   tk_tbl <- PlantGrowth %>%
+#'     rstatix::aov_test(weight ~ group) %>%            # ANOVA
+#'     rstatix::tukey_hsd()                             # pairwise Tukey
+#'
+#'   get_letters(tk_tbl)
+#' }
+#'
+#' @export
+get_letters <- function(data,
+                        p_col = "p.adj",
+                        group1 = "group1",
+                        group2 = "group2",
+                        by = NULL,
+                        threshold = 0.05,
+                        sample_levels = NULL) {
+  # required pkgs ---------------------------------------------------------
+  if (!requireNamespace("multcompView", quietly = TRUE)) {
+    stop("Package 'multcompView' is required but not installed.")
+  }
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    stop("Package 'dplyr' is required but not installed.")
+  }
+  if (!requireNamespace("tidyr", quietly = TRUE)) {
+    stop("Package 'tidyr' is required but not installed.")
+  }
+  
+  dplyr  <- asNamespace("dplyr")  # avoid R CMD check notes
+  tidyr  <- asNamespace("tidyr")
+  mcView <- asNamespace("multcompView")
+  
+  # convert `by` to quosures ---------------------------------------------
+  by_quos <- rlang::enquos(by, .ignore_empty = "all")
+  if (length(by_quos) == 0) by_quos <- NULL
+  
+  # helper to process a single split (facet) ------------------------------
+  cld_one <- function(df) {
+    g1   <- df[[group1]]
+    g2   <- df[[group2]]
+    pval <- df[[p_col]]
+    
+    all_lvls <- sort(unique(c(as.character(g1), as.character(g2))))
+    if (!is.null(sample_levels)) {
+      # respect user‑supplied order but keep only observed levels
+      all_lvls <- sample_levels[sample_levels %in% all_lvls]
+    }
+    # build symmetric matrix ---------------------------------------------
+    mat <- matrix(1, nrow = length(all_lvls), ncol = length(all_lvls),
+                  dimnames = list(all_lvls, all_lvls))
+    # fill lower & upper triangles
+    for (i in seq_len(nrow(df))) {
+      mat[ as.character(g1[i]), as.character(g2[i]) ] <- pval[i]
+      mat[ as.character(g2[i]), as.character(g1[i]) ] <- pval[i]
+    }
+    # multcompView letters ------------------------------------------------
+    letters_vec <- mcView$multcompLetters(mat, threshold = threshold)$Letters
+    tibble::tibble(sample = names(letters_vec), letter = letters_vec)
+  }
+  
+  # split‑apply depending on `by` ----------------------------------------
+  if (is.null(by_quos)) {
+    out <- cld_one(data)
+  } else {
+    out <- dplyr::group_split(dplyr::group_by(data, !!!by_quos)) %>%
+      purrr::map_dfr(~ {
+        key_vals <- .x %>% dplyr::distinct(!!!by_quos) %>% dplyr::slice(1)
+        dplyr::bind_cols(key_vals, cld_one(.x))
+      })
+  }
+  # ensure factor order ---------------------------------------------------
+  if (!is.null(sample_levels)) {
+    out$sample <- factor(out$sample, levels = sample_levels)
+  }
+  out
+}
+
+# -------------------------------------------------------------------------
+# Test‑that examples -------------------------------------------------------
+# These tests run only if **testthat** is installed and we're *not* in
+# production knitting; they do nothing otherwise.
+if (requireNamespace("testthat", quietly = TRUE)) {
+  testthat::test_that("get_letters reproduces PlantGrowth CLDs", {
+    testthat::skip_if_not_installed("rstatix")
+    library(rstatix)
+    tk_tbl <- PlantGrowth %>%
+      aov(weight ~ group) %>%
+      tukey_hsd()
+    cld <- get_letters(tk_tbl)
+    testthat::expect_true(all(c("sample", "letter") %in% names(cld)))
+    # ensure at least two distinct letters (there are sig diffs)
+    testthat::expect_gt(length(unique(cld$letter)), 1)
+  })
+}
+
+```
+
+TET3_vs_WT
+
+```{r}
+# get the maximum value per sample, for plotting letter above it
+y_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "TET3_vs_WT") %>% 
+  group_by(kind, sample) %>% 
+  summarise(y = max(cts) * 1.3, .groups = "drop")
+
+# perform Tukey test
+tukey_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "TET3_vs_WT") %>% 
+  group_by(kind) %>%         
+  tukey_hsd(log_cts ~ sample)
+
+# obtain significant letters
+letters_tbl <- tukey_tbl %>%              
+  get_letters(by = kind,                  # <- facet column(s)
+              threshold = 0.05,           # default; change if you like
+              sample_levels = levels(df$sample))  %>% 
+  left_join(y_tbl, by = c("kind","sample"))
+```
+
+```{r fig.width=4, fig.height=3}
+degs_tes_cts_long %>% 
+  filter(comparison == "TET3_vs_WT") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "TET3 vs WT DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank()) +
+  
+  geom_text(data = letters_tbl, aes(sample, y, label = letter), inherit.aes = FALSE, size = 4, vjust = 0)
+
+ggsave2("../figures/TEcounts/boxplots-counts-DEGs-TET3_Figure4B-stats.pdf",width = 100, height = 100, unit = "mm")
+```
+
+The other two comparisons
+
+```{r}
+# get the maximum value per sample, for plotting letter above it
+y_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "NTS_vs_WT") %>% 
+  group_by(kind, sample) %>% 
+  summarise(y = max(cts) * 1.3, .groups = "drop")
+
+# perform Tukey test
+tukey_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "NTS_vs_WT") %>% 
+  group_by(kind) %>%         
+  tukey_hsd(log_cts ~ sample)
+
+# obtain significant letters
+letters_tbl_NTS_WT <- tukey_tbl %>%              
+  get_letters(by = kind,                  # <- facet column(s)
+              threshold = 0.05,           # default; change if you like
+              sample_levels = levels(df$sample))  %>% 
+  left_join(y_tbl, by = c("kind","sample"))
+```
+
+```{r}
+# get the maximum value per sample, for plotting letter above it
+y_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "NTS_vs_TET3") %>% 
+  group_by(kind, sample) %>% 
+  summarise(y = max(cts) * 1.3, .groups = "drop")
+
+# perform Tukey test
+tukey_tbl <- degs_tes_cts_long %>%
+  filter(comparison == "NTS_vs_TET3") %>% 
+  group_by(kind) %>%         
+  tukey_hsd(log_cts ~ sample)
+
+# obtain significant letters
+letters_tbl_NTS_TET3 <- tukey_tbl %>%              
+  get_letters(by = kind,                  # <- facet column(s)
+              threshold = 0.05,           # default; change if you like
+              sample_levels = levels(df$sample))  %>% 
+  left_join(y_tbl, by = c("kind","sample"))
+```
+
+```{r fig.width=8, fig.height=3}
+degs_tes_cts_long %>% 
+  filter(comparison == "NTS_vs_WT") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "NTS vs WT DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank()) +
+  
+  geom_text(data = letters_tbl_NTS_WT, aes(sample, y, label = letter), inherit.aes = FALSE, size = 4, vjust = 0) +
+  
+  degs_tes_cts_long %>% 
+  filter(comparison == "NTS_vs_TET3") %>% 
+  ggplot(aes(x = sample, y = cts, fill = condition)) +
+  facet_wrap(facets = vars(kind), scales = "free") +
+  geom_boxplot(color = "black", outlier.colour = NA, alpha = 0.7) +
+  geom_sina(shape = 16, size = 1, alpha = 0.5) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous("counts", transform = "log1p", breaks = c(0,1,3,10,30,100,300,1000,3000)) +
+  labs(subtitle = "NTS vs TET3 DETEs") +
+  theme(strip.background = element_rect(colour = NA, fill = "papayawhip"), legend.position= "none",
+        axis.ticks.x = element_blank(), axis.title.x = element_blank(),  axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), axis.line = element_blank()) +
+  
+  geom_text(data = letters_tbl_NTS_TET3, aes(sample, y, label = letter), inherit.aes = FALSE, size = 4, vjust = 0)
+
+ggsave2("../figures/TEcounts/boxplots-counts-DEGs-NTS_Fig-Supp-stats.pdf",width = 200, height = 100, unit = "mm")
+```

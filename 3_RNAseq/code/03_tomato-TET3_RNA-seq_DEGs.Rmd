@@ -1,0 +1,483 @@
+---
+title: "DEGs"
+subtitle: "_Tomato TET3 RNA-seq_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r libraries-and-functions, include=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(ComplexHeatmap)
+ht_opt$message = FALSE
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(gprofiler2)
+library(kableExtra)
+library(shadowtext)
+library(ggbeeswarm)
+library(scales)
+
+deg_cts = function(res, cts, ...) {
+  res %>%
+    #as_tibble(rownames = "id") %>%
+    inner_join(cts, by = "id") %>%
+    filter(...)
+}
+
+# Wrapper for enhancedVolcano
+enhanced_volcano <- function(res, lab = NA, xlim = c(-5, 5), ylim = c(0, 12.5), pCutoff = 0.01, FCcutoff = 1, 
+                             sample = "", reference = "", n_degs = filter(res, padj < pCutoff, abs(log2FoldChange) > FCcutoff) %>% nrow(),
+                             comparison = str_c(sample, " vs ", reference),
+                             title = str_c(comparison, " (" , n_degs, " DEGs)"), caption = FALSE,
+                             label.x = 3.75, label.y = 9, size.title = 20, size.label = size.title / 3) {
+  
+  n_degs_down <- filter(res, padj < pCutoff, log2FoldChange < -FCcutoff) %>% nrow()
+  n_degs_up   <- filter(res, padj < pCutoff, log2FoldChange >  FCcutoff) %>% nrow()
+  
+  EnhancedVolcano(res, lab = lab, x = 'log2FoldChange', y = 'padj', xlim = xlim, ylim = ylim, pCutoff = pCutoff, FCcutoff = FCcutoff, shape = 16, 
+                  title = title, subtitle = NULL, caption = if(caption) paste0("total = ", nrow(res), " genes"), titleLabSize = size.title) +
+    annotate("text", x = -label.x, y = label.y, label = paste(n_degs_down, "down"), size = size.label) +
+    annotate("text", x =  label.x, y = label.y, label = paste(n_degs_up,     "up"),  size = size.label)
+}
+```
+
+```{r load-objects}
+sample_table <- readRDS("../data/4_counts/sample_table.RDS") %>% 
+  separate(description, sep = " ", into = c("line", "genotype"), remove = FALSE, fill = "right") %>% 
+  replace_na(list(genotype = "")) %>% 
+  mutate(line = fct_inorder(line),
+         genotype = fct_inorder(genotype))
+
+dds <- readRDS("../data/4_counts/counts_dds.RDS")
+cts  <- read_tsv("../data/4_counts/counts_normalised.tsv", show_col_types = FALSE)
+tpms <- read_tsv("../data/4_counts/counts_tpm.tsv", show_col_types = FALSE)
+
+# filter vsd so it has the same length as tpms
+vsd  <- read_tsv("../data/4_counts/counts_vsd.tsv", show_col_types = FALSE) %>% 
+  filter(id %in% tpms$id)
+```
+
+### Transgene expression
+
+Before computing Differentially expressed genes let's have a look at the expression of the transgenes in the T-DNA, in our case the human TET3 catalytic domain and the Kanamycin resistance gene. 
+
+```{r aesthetic-variables}
+sample_colors      <- c(WT    = "grey40",          A4  = "tomato2",       A17 = "slateblue2")
+description_colors <- c("WT"  = "grey40", "A.T1 TET3"  = "tomato2", "A.T1 NT" = "slateblue2")
+```
+
+```{r}
+single_gene_expression_plot <- function(cts, gene_id, title = gene_id, sampletable = sample_table,
+                                        colors = description_colors) {
+  cts %>% 
+    filter(id == gene_id) %>% 
+    pivot_longer(-id, names_to = "sample", values_to = "counts") %>% 
+    left_join(sampletable, by = c("sample" = "sampleName")) %>% 
+    ggplot(aes(x = genotype, y = counts, fill = description, shape = )) +
+    facet_grid(cols = vars(line), scales = "free_x", space = "free_x", switch = "x") +
+    stat_summary(geom = "col", fun = mean, alpha = 0.7,col = 1, position = "dodge2") +
+    geom_quasirandom(shape = 21, size = 3, color = 1, dodge.width = 0.8) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = label_number(scale_cut = cut_short_scale())) +
+    scale_fill_manual("", values = colors) +
+    labs(title = title, y = "normalised counts") +
+    theme(axis.line.x = element_blank(), #panel.border = element_rect(colour="black", size=1, fill=NA), 
+          strip.background = element_rect(fill = "cornsilk"), axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0), strip.placement = "outside",
+          axis.ticks.x = element_blank(), panel.grid.major.y = element_line(linewidth = 0.2, color = "grey50"),
+          plot.title = element_text(size = 12), legend.position = "none")
+}
+```
+
+> TET3 is very highly expressed in A.T1 TET3, the highest after CAT1.
+The Kanamycin resistance gene is also high expressed around ranking 1000.
+A1.T1 NT plant is not expressing the transgenes, confirming it is non transgenic
+
+```{r fig.width=6, fig.height=4}
+single_gene_expression_plot(cts, gene_id = "gene:NeoR/KanR", title = "KanR (Kanamycin resistance)") +
+  single_gene_expression_plot(cts, gene_id = "gene:TET3c", title = "TET3 Catalytic Domain")  +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Expression of T-DNA transgenes",
+                  subtitle = "columns represent average value",
+                  caption = "TET3 is very highly expressed in A.T1 TET3, the highest after CAT1.
+The Kanamycin resistance gene is also high expressed around ranking 1000.
+A1.T1 NT plant is not expressing the transgenes, confirming it is non transgenic.")
+  
+ggsave2("../figures/transgenes-expression.pdf", width = 6, height = 4)
+```
+
+```{r}
+cts %>% arrange(-A4_2)
+```
+
+
+### DEGs
+
+Get the statistics for each of the comparisons in a list
+```{r}
+res = list(
+  A4_vs_WT  = results(dds, contrast=c("condition", "A4",  "WT")) %>% as_tibble(rownames = "id"),
+  A17_vs_WT = results(dds, contrast=c("condition", "A17", "WT")) %>% as_tibble(rownames = "id"),
+  A17_vs_A4 = results(dds, contrast=c("condition", "A17", "A4")) %>% as_tibble(rownames = "id")
+)
+```
+
+get the counts for the DEGs (also as a list)
+```{r}
+DEGs_cts <- map(res, ~ deg_cts(.x, cts))
+```
+
+get the variance stabilized counts for the DEGs (also as a list)
+```{r}
+DEGs_vsd <- map(res, ~ deg_cts(.x, vsd))
+```
+
+Join all DEGs with its counts in a unique table
+```{r}
+DEGs_vsd_all <- DEGs_vsd %>%
+  map_df(.id = "comparison", ~ .x) %>%
+  mutate(comparison = as_factor(comparison))
+```
+
+And you can filter it as a tibble
+
+```{r}
+DEGs_vsd_all %>%
+  filter(id == "gene:Solyc02g071010.1")
+```
+
+Alternative you can filter and keep the list structure
+
+```{r}
+DEGs_vsd_p01_lfc1 <- map(DEGs_vsd, ~ filter(., padj < 0.01, abs(log2FoldChange) > 1))
+```
+
+Write the DEGs to a Excel file with tabs for each comparison
+
+```{r}
+dir.create("../data/6_degs/", showWarnings = FALSE)
+writexl::write_xlsx(DEGs_vsd_p01_lfc1, path = "../data/6_degs/DEGs_p01_lfc1_with_vsd.xlsx")
+```
+
+And save it as a RDS object for easy loading
+
+```{r}
+saveRDS(DEGs_vsd_p01_lfc1, file = "../data/6_degs/DEGs.RDS")
+```
+
+### DEGs number
+
+```{r fig.height=5, fig.width=5}
+DEGs_vsd_all %>%
+  filter(padj < 0.01, abs(log2FoldChange) > 1) %>% 
+  group_by(comparison,  log2FoldChange > 0) %>%
+  dplyr::count(comparison) %>%
+  rename(kind = `log2FoldChange > 0`, DEGs = n) %>%
+  mutate(kind = case_when(kind == TRUE ~ "up",
+                          kind == FALSE ~ "down"),
+         group = case_when(str_detect(comparison, "WT") ~ "A.T1\n vs WT",
+                           .default = "between\nA.T1") %>% 
+           factor(levels = c("A.T1\n vs WT", "between\nA.T1")),
+         comparison = str_replace(comparison, "A4", "A.T1 TET3") %>% 
+           str_replace("A17", "A.T1 NT") %>% 
+           str_replace_all("_", "\n")) %>%
+  ggplot(aes(comparison, DEGs, fill = kind, label = DEGs)) +
+  facet_grid(cols = vars(group), scales = "free", space = "free") +
+  geom_col(position = "stack", color = 1, alpha = 0.7) +
+  geom_shadowtext(position = "stack", color = "white", check_overlap = TRUE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Number of DEGs",
+       subtitle = "p.adj < 0.01 & |logFC| > 1",
+       caption = "Tomato TET3 RNA-seq") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.line=element_blank(), axis.ticks.x = element_blank(), 
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        legend.position = "top", legend.direction = "horizontal",
+        strip.background = element_rect(fill = "pink"))
+
+ggsave("../figures/DEGs_number.pdf", width = 5, height = 5)
+```
+
+
+
+### Volcano plots {.tabset}
+
+Using enhanced volcano
+
+#### Zoom out
+
+```{r fig.width=10,  fig.height=16}
+(volcanos <- enhanced_volcano(res$A4_vs_WT,  sample = "A.T1 TET3 (A4)", reference = "WT", xlim = c(-9, 9), ylim = c(0, 110), label.x = 7, label.y = 60) /
+             enhanced_volcano(res$A17_vs_WT, sample = "A.T1 NT (A17)",  reference = "WT", xlim = c(-9, 9), ylim = c(0, 110), label.x = 7, label.y = 60) /
+             enhanced_volcano(res$A17_vs_A4, sample = "A.T1 NT", reference = "A.T1 TET3", xlim = c(-9, 9), ylim = c(0, 110), label.x = 7, label.y = 60, caption = TRUE) +
+  plot_layout(guides = 'collect') &  theme(legend.position = 'bottom'))
+
+ggsave(filename = "../figures/volcano_plots_all.pdf", plot = volcanos, width = 10, height = 16)
+```
+
+#### Zoom in
+
+```{r fig.width=10,  fig.height=16}
+(volcanos <- enhanced_volcano(res$A4_vs_WT,  sample = "A.T1 TET3 (A4)", reference = "WT") /
+             enhanced_volcano(res$A17_vs_WT, sample = "A.T1 NT (A17)",  reference = "WT") /
+             enhanced_volcano(res$A17_vs_A4, sample = "A.T1 NT", reference = "A.T1 TET3", caption = TRUE) +
+  plot_layout(guides = 'collect') &  theme(legend.position = 'bottom'))
+
+ggsave(filename = "../figures/volcano_plots_zoom.pdf", plot = volcanos, width = 10, height = 16)
+```
+
+#### Zoom in for figure
+
+```{r fig.width=10,  fig.height=16}
+(volcanos <- enhanced_volcano(res$A4_vs_WT,  sample = "TET3", reference = "WT", xlim = c(-7, 7), ylim = c(0, 50), label.x = 5, label.y = 40) /
+             enhanced_volcano(res$A17_vs_WT, sample = "NTS",  reference = "WT", xlim = c(-7, 7), ylim = c(0, 50), label.x = 5, label.y = 40) /
+             enhanced_volcano(res$A17_vs_A4, sample = "NTS", reference = "TET3", xlim = c(-7, 7), ylim = c(0, 50), label.x = 5, label.y = 40, caption = TRUE) +
+  plot_layout(guides = 'collect') &  theme(legend.position = 'bottom'))
+
+ggsave(filename = "../figures/volcano_plots_zoom-2.pdf", plot = volcanos, width = 10, height = 16)
+```
+
+### Comparison of DEGs with different thresholds
+
+```{r fig.height=7, fig.width=11}
+visualise_degs <- function(DEGs_vsd_all, padj_lim, lfc_lim, fill = bin_padj) {
+  DEGs_vsd_all %>%
+    filter(padj <= padj_lim, abs(log2FoldChange) > lfc_lim) %>%
+    mutate(rank = ntile(padj, 10), 
+           logpadj = -log10(padj),
+           bin_padj = cut(padj, c(1, 0.5, 0.1, 0.05, 0.01, 0.001, 0.0001, 0)),
+           bin_padj = fct_reorder(bin_padj, -padj),
+           bin_l2fc = cut(log2FoldChange, c(-Inf, -10, -4, -2, -1, -0.5, 0, 0.5, 1, 2, 4, 10, Inf)),
+           bin_l2fc = fct_reorder(bin_l2fc, log2FoldChange),
+           bin_absl2fc = cut(abs(log2FoldChange), c(0, 0.5, 1, 2, 4, 10, Inf)),
+           bin_absl2fc = fct_reorder(bin_absl2fc, abs(log2FoldChange))) %>%
+    group_by(comparison, {{ fill }}) %>%
+    summarise(count = n(), .groups = 'drop') %>%
+    ggplot(aes(x = count, y = comparison, fill = {{ fill }})) +
+    geom_col(color = NA) +
+    ggtitle(str_c("DEGs with a p-adj <= ", padj_lim, " & abs(log2FC) > ", lfc_lim)) +
+    scale_fill_viridis_d(direction = -1, option = if_else(deparse(substitute(fill)) == "bin_padj" , "plasma", "viridis")) +
+    #scale_fill_distiller(palette = 2)
+    scale_y_discrete(limits = rev)
+}
+
+deg_pv <- visualise_degs(DEGs_vsd_all, padj_lim = 0.05, lfc_lim = 1, fill = bin_padj)
+deg_fc <- visualise_degs(DEGs_vsd_all, padj_lim = 0.05, lfc_lim = 1, fill = bin_absl2fc)
+
+all_pv <- visualise_degs(DEGs_vsd_all, padj_lim = 1, lfc_lim = 0, fill = bin_padj)
+all_fc <- visualise_degs(DEGs_vsd_all, padj_lim = 1, lfc_lim = 0, fill = bin_absl2fc)
+
+(DEGs_padj_l2fc <- (all_pv + all_fc + deg_pv + deg_fc))
+ggsave2("../figures/DEGs_padj_l2fc.pdf", width = 11, height = 7)
+```
+
+### Heatmaps
+
+```{r}
+deg_mat = function(res, cts, ..., scaled = FALSE) {
+  deg_cts(res, cts, ...) %>% # ...) %>%
+    column_to_rownames("id") %>%
+    select(-c(baseMean:padj)) %>%
+    rename_with(~ .x %>% toupper() %>% str_replace_all("_", " ")) %>%
+    as.matrix() %>%
+    {if(scaled) {t(.) %>% scale() %>% t()}
+      else .}
+}
+
+hm_wrapper = function(mat, scaled = F, cluster_rows = T, cluster_columns = T, title = "") {
+  if(scaled) {col = rev(brewer.pal(9, "RdBu"));  name = "scaled\nexpression"}
+  else       {col =     brewer.pal(9, "YlOrRd"); name = "expression"}
+  Heatmap(mat, cluster_rows = cluster_rows, cluster_columns = cluster_columns, show_row_names = F, col = col, name = name, column_title = title)
+}
+
+deg_hm = function(res, cts, ..., scaled = F, file = F, title = NULL) {
+  mat = deg_mat(res = res, cts = cts, ... = ..., scaled = scaled)
+  if (file != 0) {
+    pdf(file, height = 5, width = 5)
+      hm <- hm_wrapper(mat, scaled = scaled)
+      draw(hm, column_title = paste(nrow(mat), title, "DEGs", deparse(substitute(...))))
+    dev.off()
+  } else {
+    hm_wrapper(mat, scaled = scaled, title = title)
+  }
+}
+```
+
+```{r}
+DEGs_vsd_p01_lfc1$A17_vs_WT %>%
+  arrange(-log2FoldChange)
+
+DEGs_vsd_p01_lfc1$A17_vs_WT %>%
+  arrange(-baseMean)
+```
+
+```{r}
+mats <- list(
+  raw    = map(res, ~ deg_mat(.x, vsd, padj < 0.01, abs(log2FoldChange) > 1)),
+  scaled = map(res, ~ deg_mat(.x, vsd, padj < 0.01, abs(log2FoldChange) > 1, scaled = T))
+) %>%
+  transpose() # to get A4$raw instead of raw$A4
+```
+
+```{r}
+hm_wrapper(mats$A4$scaled, scaled = T) +
+  hm_wrapper(mats$A4$raw)
+```
+
+```{r}
+deg_hm(res$A4_vs_WT, vsd, padj < 0.01, abs(log2FoldChange) > 1, title = "DEGs A4", scaled = TRUE) +
+  deg_hm(res$A4_vs_WT, tpms, padj < 0.01, abs(log2FoldChange) > 1, title = "DEGs A4", scaled = FALSE)
+```
+A4 
+```{r}
+deg_hm(res$A4, vsd, 
+       padj < 0.01, abs(log2FoldChange) > 1, title = "A4", scaled = TRUE, file="../figures/heatmap_DEGs_A4_lfc1_p0.01.pdf")
+deg_hm(res$A4, vsd %>% select(id, WT_1:A4_2),
+       padj < 0.01, abs(log2FoldChange) > 1, title = "A4", scaled = TRUE, file="../figures/heatmap_DEGs_A4_only_lfc1_p0.01.pdf")
+```
+
+```{r}
+hms_A4 <- deg_hm(res$A4_vs_WT,   vsd,                padj < 0.01, abs(log2FoldChange) > 1, title = "A4 DEGs", scaled = TRUE) +
+  deg_hm(res$A4_vs_WT, vsd %>% select(id, WT_1:A4_2), padj < 0.01, abs(log2FoldChange) > 1, title = "A4 only", scaled = TRUE) +
+  deg_hm(res$A4_vs_WT, tpms,                          padj < 0.01, abs(log2FoldChange) > 1, title = "TPMs", scaled = FALSE) 
+
+hms_A17 <- deg_hm(res$A17_vs_WT,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "A17 DEGs", scaled = TRUE) +
+  deg_hm(res$A17_vs_WT, vsd %>% select(id, WT_1:WT_2, A17_1:A17_2), padj < 0.01, abs(log2FoldChange) > 1, title = "A17 only", scaled = TRUE) +
+  deg_hm(res$A17_vs_WT, tpms,                                       padj < 0.01, abs(log2FoldChange) > 1, title = "TPMs", scaled = FALSE)
+```
+
+```{r fig.width=6, fig.height=7}
+pdf(file = "../figures/heatmap_DEGs_all.pdf", height = 9, width = 7) 
+grid.newpage()
+pushViewport(viewport(x = 0, y = 1, height = 0.5, just = c("left", "top")))
+draw(hms_A4, newpage = FALSE, column_title = "391 A4 DEGs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.5, height = 0.5, just = c("left", "top")))
+draw(hms_A17, newpage = FALSE, column_title = "1086 A17 DEGs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+dev.off()
+```
+
+```{r}
+hms_A4 <- deg_hm(res$A4_vs_WT, tpms,                          padj < 0.01, abs(log2FoldChange) > 1, title = "TPMs", scaled = FALSE)  +
+  deg_hm(res$A4_vs_WT,   vsd,                padj < 0.01, abs(log2FoldChange) > 1, title = "A4 DEGs", scaled = TRUE) +
+  deg_hm(res$A4_vs_WT, vsd %>% select(id, WT_1:A4_2), padj < 0.01, abs(log2FoldChange) > 1, title = "A4 only", scaled = TRUE)
+
+hms_A17 <- deg_hm(res$A17_vs_WT, tpms,                                       padj < 0.01, abs(log2FoldChange) > 1, title = "TPMs", scaled = FALSE) +
+  deg_hm(res$A17_vs_WT,   vsd,                             padj < 0.01, abs(log2FoldChange) > 1, title = "A17 DEGs", scaled = TRUE) +
+  deg_hm(res$A17_vs_WT, vsd %>% select(id, WT_1:WT_2, A17_1:A17_2), padj < 0.01, abs(log2FoldChange) > 1, title = "A17 only", scaled = TRUE)
+```
+
+```{r fig.width=6, fig.height=7}
+pdf(file = "../figures/heatmap_DEGs_all-unscaled.pdf", height = 9, width = 7) 
+grid.newpage()
+pushViewport(viewport(x = 0, y = 1, height = 0.5, just = c("left", "top")))
+draw(hms_A4, newpage = FALSE, column_title = "391 A4 DEGs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+
+pushViewport(viewport(x = 0, y = 0.5, height = 0.5, just = c("left", "top")))
+draw(hms_A17, newpage = FALSE, column_title = "1086 A17 DEGs padj < 0.01 & |log2FC| > 1", 
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"))
+popViewport()
+dev.off()
+```
+
+### Go term analysis
+
+Done in a different Rmd file
+
+### DEGs across genome
+
+```{r}
+library(plyranges)
+
+facet_chr <- function(chr = chr, rows = NULL, scales = "free_x", space = "free_x", breaks = 40e6) {
+  list(facet_grid(rows = vars({{ rows }}), cols = vars({{ chr }}), scales = scales, space = space),
+       scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(breaks), labels = scales::label_number_si()),
+       xlab("Position across the genome (Mbp)"))
+}
+```
+
+```{r}
+
+genes_df <- read_gff("/path/to/genome/version_4/ITAG4.1_gene_models.gff") %>%
+  filter(type == "gene",
+         seqnames != "SL4.0ch00") %>%
+  select(ID, Name) %>%
+  as_tibble() %>%
+  mutate(seqnames = str_remove(seqnames, "SL4.0"))
+
+genes <- genes_df %>%
+  as_granges()
+
+load(file = "/path/to/project/rnaseq/DEGs.Rdata")
+degs_df <- DEGs_cts_p01_lfc1 %>%
+  map_df(.id = "comparison", ~ .x %>% 
+           mutate(direction = case_when(log2FoldChange > 0 ~ "up",
+                                        log2FoldChange < 0 ~ "down",
+                                        TRUE ~ "something is wrong"))) %>%
+  left_join(genes_df, by = c("id" = "ID")) %>%
+  select(-id) %>%
+  relocate(seqnames:Name, comparison, direction, log2FoldChange, padj)
+```
+
+
+##### Density
+
+```{r fig.height=4, fig.width=10}
+
+genes %>%
+  as_tibble() %>%
+  ggplot(aes(x = start)) +
+  facet_chr(chr = seqnames) +
+  geom_density(adjust = 1/1, alpha = 0.2, color = 1, fill = 1) +
+  scale_color_brewer(palette = "Set1", direction = -1) + 
+  scale_fill_brewer(palette  = "Set1", direction = -1) +
+  guides(color = "none", fill = "none") 
+
+ggplot(degs_df, aes(x = start, color = direction, fill = direction)) +
+  facet_chr(chr = seqnames, rows = comparison) +
+  geom_density(adjust = 1/3, alpha = 0.2) +
+  scale_color_brewer(palette = "Set1", direction = -1) + 
+  scale_fill_brewer(palette  = "Set1", direction = -1)
+```
+
+##### Count
+
+```{r fig.height=4, fig.width=10}
+genes %>%
+  as_tibble() %>%
+  ggplot(aes(x = start)) +
+  facet_chr(chr = seqnames, scales = "free", space = "free") +
+  geom_area(aes(y = ..count..), stat = "bin", alpha = 0.2, binwidth = 3e6, color = 2, fill = 2) +
+  ylab("genes per 3Mb")
+ggsave("/path/to/project/rnaseq/figures/genes_across_genome.pdf", width = 8, height = 3)
+
+ggplot(degs_df, aes(x = start, color = direction, fill = direction)) +
+  facet_chr(chr = seqnames, rows = comparison, scales = "free", space = "free") +
+  geom_area(aes(y = ..count..), stat = "bin", alpha = 0.2, binwidth = 3e6) +
+  scale_color_brewer(palette = "Set1", direction = -1) + 
+  scale_fill_brewer(palette  = "Set1", direction = -1) +
+  #guides(color = "none", fill = "none")  +
+  ylab("DEGs per 3Mb")
+ggsave("/path/to/project/rnaseq/figures/DEGs_across_genome.pdf", width = 8, height = 5)
+```
+

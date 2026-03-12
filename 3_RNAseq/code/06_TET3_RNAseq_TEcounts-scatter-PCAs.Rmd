@@ -1,0 +1,426 @@
+---
+title: "Scatter plots and PCAs of counts"
+subtitle: "_Tomato TET3 RNA-seq_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r libraries-and-functions, include=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(ggbeeswarm)
+library(ggrastr)
+
+tpms_from_dds <- function(dds, gene_lengths) {
+  counts(dds, normalized = F) %>%
+  as_tibble(rownames = "id") %>%
+  inner_join(read_tsv(gene_lengths, col_types = cols()), 
+             by="id") %>%
+  mutate(across(-c(id, length), ~ (.x / length)),       # rpk = count / length
+         across(-c(id, length), ~ 1e+6 * .x / sum(.x)), # tpm = 1M * rpk / sum(rpk)
+         across(-c(id, length), ~ log2(1 + .x))) %>%    # log2tpm = log2(1 + tpm) %>%
+  dplyr::select(-length)
+}
+```
+
+## Load counts and run DESeq2
+
+Create sample table
+```{r}
+(sampleTable <- list(sample = c("WT", "TET3", "NTS"), replica = c(1, 2)) %>%
+  expand_grid(!!!.) %>%  
+  pmap_chr(paste, sep = "_") %>%
+  tibble(sampleName = .) %>%
+   mutate(fileName = str_c(sampleName, ".cntTable"),
+          condition = str_remove(sampleName, "_[:digit:]") %>% factor(levels = c("WT", "TET3", "NTS")),
+          replica = str_remove(sampleName, ".*_") %>% as_factor()) %>%
+   arrange(condition, replica) %>% 
+   mutate(description = c("WT", "WT", "A.T1 TET3", "A.T1 TET3", "A.T1 NT", "A.T1 NT")))
+
+write_tsv(sampleTable, "../data/4_counts/sample_table_TEcounts.tsv")
+saveRDS(sampleTable, file = "../data/4_counts/sample_table_TEcounts.RDS")
+```
+
+Modify manually the `.cntTable` files to remove the first line.
+
+Make `dds` object form counts ans run DESeq
+```{r}
+dds <- DESeqDataSetFromHTSeqCount(sampleTable = sampleTable, 
+                                  directory = "../data/4_counts/TEcounts/", 
+                                  design = ~ condition) %>% 
+  DESeq()
+```
+
+Get normalised counts
+```{r}
+cts <- dds %>%
+  counts(normalized = TRUE) %>% 
+  as_tibble(rownames = "id")
+```
+
+Get vst (Variance Stabilised Transformation), it will make your valued approach a normal distribution, as compared to a negative binomial distribution of the normalised counts.
+```{r}
+vsd <- dds %>% 
+  vst(blind = FALSE) %>% 
+  assay() %>%
+  as_tibble(rownames = "id") #%>% 
+  #filter(!id %in% c("gene:NeoR/KanR", "gene:TET3c"))
+```
+
+Get TPMs - NOT POSIBLE FOR TEs.
+```{r}
+# tpms <- tpms_from_dds(dds , "/path/to/genome/ITAG4.1/ITAG4.1_gene_lengths.tsv")
+```
+
+Save the objects as `.tsv` and as `.RDS` object
+```{r save-objects}
+write_rds(dds, file = "../data/4_counts/TEcounts/TEcounts_dds.rds")
+
+write_tsv(cts,  "../data/4_counts/TEcounts/TEcounts_normalised.tsv")
+write_tsv(vsd,  "../data/4_counts/TEcounts/TEcounts_vsd.tsv")
+```
+
+## Split counts in Genes and TEs
+
+```{r}
+cts_genes <- filter(cts,  str_starts(id, "gene"))
+cts_TEs   <- filter(cts, !str_starts(id, "gene"))
+
+vsd_genes <- filter(vsd,  str_starts(id, "gene"))
+vsd_TEs   <- filter(vsd, !str_starts(id, "gene"))
+```
+
+
+## Scatter plots 
+
+```{r}
+# Function to have a matrix of scatter plots
+scatter_matrix <- function(cts, condition, log_values = TRUE, title = paste("Scatter plot of log(normalised counts) from", condition), lims = c(NA, NA)) {
+  cts %>%
+    select(id, starts_with(condition)) %>%
+    {if(log_values) mutate(., across(-id, ~ log2(1 + .))) else .} %>%
+    add_column(slope = 1) %>% 
+    add_column(intercept = 0) %>%
+    ggplot(aes(x = .panel_x, y = .panel_y)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf), fill = "#440154FF") +
+    geom_point(shape = 16, size = 0.3, alpha = 0.5) %>% rasterise(dpi = 300) +
+    geom_point(shape = 16, size = 0, alpha = 0) +
+    geom_point(shape = 16, size = 0, alpha = 0) +
+    #geom_density_2d_filled(contour_var = "ndensity") +
+    geom_abline(aes(intercept = intercept, slope = slope), color = "red", alpha = 0.5) +
+    geom_autohistogram(color = 1, fill = 3) +
+    facet_matrix(vars(-c(id, slope, intercept)), layer.upper = c(2,5), layer.lower = c(1,3,4,5), layer.diag = 6) +
+    coord_cartesian(xlim = lims, ylim = lims) +
+    theme(axis.line = element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), 
+        strip.background = element_blank(), plot.title = element_text(hjust = 0.5), legend.position = "none") +
+    ggtitle(title)
+}
+```
+
+### All conditions compared (vsd)
+
+```{r fig.height=10, fig.width=10}
+scatter_matrix(vsd, c("W", "T", "N"), title = "", log_values = FALSE, lims = c(NA, 18)) +
+   labs(title = "Scatter plots of vsd (variance stabilised transformed counts)",
+        subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+        caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels") 
+
+ggsave(filename = "../figures/TEcounts/scatter_matrix_vsd_all.pdf", height = 13, width = 12)
+```
+
+### Each condition separately (cts) {.tabset .tabset-pills}
+
+#### WT
+
+```{r fig.height=5, fig.width=5}
+scatter_matrix(cts, "WT")
+```
+
+#### TET3 
+
+```{r fig.height=5, fig.width=5}
+scatter_matrix(cts, "TET3")
+```
+
+#### NTS
+
+```{r fig.height=5, fig.width=5}
+scatter_matrix(cts, "NTS")
+```
+
+### All conditions separated {.tabset .tabset-pills}
+
+#### counts
+ 
+```{r fig.height=5, fig.width=11}
+(scatter_matrix_cts <- scatter_matrix(cts, "WT", title = "WT") + 
+   scatter_matrix(cts, "TET3", title = "TET3") +
+   scatter_matrix(cts, "NTS", title = "NTS") +
+   plot_annotation(title = "Scatter plots of log(1 + normalised counts)",
+                   subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+                   caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels")) 
+
+dir.create("../figures/TEcounts/", showWarnings = FALSE)
+ggsave(filename = "../figures/TEcounts/scatter_matrix_normalised_counts.pdf", plot = scatter_matrix_cts, height = 5, width = 11)
+```
+
+#### vsd {.active}
+
+```{r fig.height=5, fig.width=11}
+(scatter_matrix_vsd <- scatter_matrix(vsd, "WT", title = "WT", log_values = FALSE) + 
+   scatter_matrix(vsd, "TET3", title = "TET3", log_values = FALSE) +
+   scatter_matrix(vsd, "NTS", title = "NTS", log_values = FALSE) +
+   plot_annotation(title = "Scatter plots of vsd (variance stabilised transformed counts)",
+                   subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+                   caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels")) 
+
+ggsave(filename = "../figures/TEcounts/scatter_matrix_vsd.pdf", plot = scatter_matrix_vsd, height = 5, width = 11)
+```
+
+### All conditions compared - Genes and TEs separated (vsd)
+
+#### Genes
+
+```{r fig.height=10, fig.width=10}
+scatter_matrix(vsd_genes, c("W", "T", "N"), title = "", log_values = FALSE, lims = c(NA, 18)) +
+   labs(title = "Scatter plots of vsd (variance stabilised transformed counts)",
+        subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+        caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels") 
+
+ggsave(filename = "../figures/TEcounts/scatter_matrix_vsd_all-Genes.pdf", height = 13, width = 12)
+```
+
+#### TEs
+
+```{r fig.height=10, fig.width=10}
+scatter_matrix(vsd_TEs, c("W", "T", "N"), title = "", log_values = FALSE, lims = c(NA, 18)) +
+   labs(title = "Scatter plots of vsd (variance stabilised transformed counts)",
+        subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+        caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels") 
+
+ggsave(filename = "../figures/TEcounts/scatter_matrix_vsd_all-TEs.pdf", height = 13, width = 12)
+```
+
+### Genes and TEs separated {.tabset .tabset-pills}
+
+#### counts
+ 
+```{r fig.height=9, fig.width=11}
+(scatter_matrix_cts <- scatter_matrix(cts_genes, "WT", title = "WT: Genes") + 
+   scatter_matrix(cts_genes, "TET3", title = "TET3: Genes") +
+   scatter_matrix(cts_genes, "NTS", title = "NTS: Genes") +
+   scatter_matrix(cts_TEs, "WT", title = "WT: TEs") + 
+   scatter_matrix(cts_TEs, "TET3", title = "TET3: TEs") +
+   scatter_matrix(cts_TEs, "NTS", title = "NTS: TEs") +
+   plot_annotation(title = "Scatter plots of log(1 + normalised counts)",
+                   subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+                   caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels")) 
+
+dir.create("../figures/TEcounts/", showWarnings = FALSE)
+ggsave(filename = "../figures/TEcounts/scatter_matrix_normalised_counts-split-Genes-TEs.pdf", plot = scatter_matrix_cts, height = 9, width = 11)
+```
+
+#### vsd {.active}
+
+```{r fig.height=9, fig.width=11}
+(scatter_matrix_vsd <- scatter_matrix(vsd_genes, "WT", title = "WT: Genes", log_values = FALSE) + 
+   scatter_matrix(vsd_genes, "TET3", title = "TET3: Genes", log_values = FALSE) +
+   scatter_matrix(vsd_genes, "NTS", title = "NTS: Genes", log_values = FALSE) +
+   scatter_matrix(vsd_TEs, "WT", title = "WT: TEs", log_values = FALSE) + 
+   scatter_matrix(vsd_TEs, "TET3", title = "TET3: TEs", log_values = FALSE) +
+   scatter_matrix(vsd_TEs, "NTS", title = "NTS: TEs", log_values = FALSE) +
+   plot_annotation(title = "Scatter plots of vsd (variance stabilised transformed counts)",
+                   subtitle = "diagonal of the matrix represents distribution of expression values \nbottom half show density plot of expression values",
+                   caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels")) 
+
+ggsave(filename = "../figures/TEcounts/scatter_matrix_vsd-split-Genes-TEs.pdf", plot = scatter_matrix_vsd, height = 9, width = 11)
+```
+
+
+## PCAs
+
+
+```{r}
+# General function for all RNA-seq that takes vsd (or other kind of counts) and returns a table of Principal Components 
+pca_tidy = function(counts, ntop = 5000, sampletable = NULL) {
+  # pick the top n genes by variance
+  top_genes <- counts %>%
+    rowwise(id) %>% # calculate the variance for each gene
+    mutate(var = var(c_across(everything()))) %>%
+    ungroup() %>%
+    slice_max(var, n = ntop) %>% # pick only the top n
+    select(-var)
+  
+  # perform a PCA on the data
+  pca <- top_genes %>%
+    select(-id) %>% 
+    na.omit() %>% 
+    t() %>% 
+    prcomp()
+  
+  # convert it to a table
+  pca$x %>%
+    as_tibble(rownames = "sample") %>%
+    rename_with(~ pca$sdev^2 %>%        # square the sd to get the variance
+                  divide_by(sum(.)) %>% # divide it by the sum of variances
+                  multiply_by(100) %>%  # *100 to get a percentage of variance
+                  round() %>%           # round it
+                  str_c(.x, " [", ., "%]"), # paste it to the PCx 
+                .cols = -sample) %>% # exclude the sample column 
+    {
+      if (is.null(sampletable)) .
+      else left_join(., sampletable, by = c("sample" = "sampleName"))
+    }
+}
+```
+
+```{r}
+pca_tidy(vsd)
+```
+
+```{r}
+# Aesthetics to plot the PCA and other plots
+condition_colors <- c(WT  = "grey40", TET3  = "tomato2", NTS = "slateblue2")
+
+replica_colors <- c(WT_1  = "grey60", WT_2  = "grey30", 
+                    TET3_1  = "tomato1", TET3_2  = "tomato3", 
+                    NTS_1 = "slateblue1", NTS_2 = "slateblue3")
+
+replica_shapes <- c("1" = 21, "2" = 24)
+```
+
+
+```{r}
+# Function to make a matrix of PCA plots
+pca_matrix = function(pctable, pcs = 1:3) {
+  ggplot(pctable, aes(x = .panel_x, y = .panel_y)) + 
+    theme_cowplot() +
+    theme(axis.line=element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), 
+          strip.background = element_blank(), plot.title = element_text(hjust = 0.5)) +
+    scale_shape_manual(values = replica_shapes) +
+    scale_fill_manual(values = condition_colors) +
+    guides(fill = guide_legend(override.aes = list(shape = 22)), 
+           shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+    #geom_mark_hull(aes(fill = condition), radius = 0.05, concavity = 1, expand = 0.1) +
+    geom_mark_ellipse(aes(fill = condition)) +
+    geom_autohistogram(aes(fill = condition), color = "black", linewidth = 0.6, alpha = 0.7, show.legend = FALSE) +
+    geom_point(aes(fill = condition, shape = replica), size = 2, color = "black") +
+    facet_matrix(vars(pcs +1), layer.lower = c(1, 3), layer.upper = 3, layer.diag = 2)
+}
+```
+
+> PC1 (75%) separates NTS from the rest, and PC2 WT from TET3 samples. PC3 explains variance between TET3 replicas
+
+```{r fig.height=6, fig.width=6}
+(pca_plot_vsd <- pca_tidy(vsd, sampletable = sampleTable) %>%
+  pca_matrix(pcs = 1:3) +
+  labs(title = ("Matrix of PCs for vsd\n(variance stabilised transformed counts)"),
+       subtitle = "Percentage of variance explained by each PC in square brackets"))
+
+ggsave(filename = "../figures/TEcounts/PCA_matrix.pdf", plot = pca_plot_vsd, width = 6, height = 6)
+```
+
+```{r fig.height=6, fig.width=12}
+(pca_plot_vsd <- pca_tidy(vsd_genes, sampletable = sampleTable) %>%
+   pca_matrix(pcs = 1:3) +
+   labs(title = "Genes") +
+   pca_tidy(vsd_TEs, sampletable = sampleTable) %>%
+   pca_matrix(pcs = 1:3) +
+   labs(title = "TEs") +
+   plot_layout(nrow = 1, guides = "collect") +
+  plot_annotation(title = ("Matrix of PCs for vsd\n(variance stabilised transformed counts)"),
+                  subtitle = "Percentage of variance explained by each PC in square brackets"))
+
+ggsave(filename = "../figures/TEcounts/PCA_matrix-splot-Genes-TEs.pdf", plot = pca_plot_vsd, width = 12, height = 6)
+```
+## PC1 vs PC2
+
+```{r}
+pca_table_genes <- pca_tidy(vsd_genes, sampletable = sampleTable) 
+pca_table_TEs <- pca_tidy(vsd_TEs, sampletable = sampleTable) 
+    
+pca_matrix(pca_table, pcs = 1:3)
+```
+
+
+```{r fig.height=6, fig.width=10}
+# PC1 vs PC2
+(ggplot(pca_table_genes, aes(x = `PC1 [73%]`, y = `PC2 [13%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, 
+                    label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = replica)) +
+  coord_fixed(ylim = c(-18, 15)) +
+  scale_shape_manual("Replica", values = replica_shapes) +
+  scale_fill_manual("Line", values = condition_colors) +
+  labs(title = "Genes") +
+  guides(fill = "none", 
+         shape = guide_legend(override.aes = list(fill = "grey95", size = 3))) +
+  theme_cowplot() +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        legend.position = "inside", legend.position.inside = c(0.55, 0.25))) +
+(ggplot(pca_table_TEs, aes(x = `PC1 [33%]`, y = `PC2 [29%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, 
+                    label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = replica)) +
+  coord_fixed()+#ylim = c(-18, 15)) +
+  scale_shape_manual("Replica", values = replica_shapes) +
+  scale_fill_manual("Line", values = condition_colors) +
+  labs(title = "TEs",) +
+  guides(fill = "none", 
+         shape = guide_legend(override.aes = list(fill = "grey95", size = 3))) +
+  theme_cowplot() +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        legend.position = "inside", legend.position.inside = c(0.83, 0.88))) +
+  plot_layout(widths = c(1.2, 1)) +
+  plot_annotation(title = ("PCA of RNA-seq counts"),
+                  subtitle = "for Genes NTS stands out, but for TEs all samples are equally different",
+                  caption = "Percentage of variance explained by each PC in square brackets")
+
+
+ggsave2(filename = "../figures/PCA_1-vs-2_split-Genes-TEs.pdf", width = 10, height = 6)
+```
+
+## Cheeky heatmap
+
+```{r fig.height=8, fig.width=4}
+vsd_genes %>%
+    rowwise(id) %>% # calculate the variance for each gene
+    mutate(var = var(c_across(everything()))) %>%
+    ungroup() %>%
+    slice_max(var, n = 50) %>% # pick only the top n
+    select(-c(var)) %>% 
+  column_to_rownames("id") %>% 
+  pheatmap::pheatmap(scale = "row")
+```
+
+```{r fig.height=8, fig.width=5}
+vsd_TEs %>%
+    rowwise(id) %>% # calculate the variance for each gene
+    mutate(var = var(c_across(everything()))) %>%
+    ungroup() %>%
+    slice_max(var, n = 50) %>% # pick only the top n
+    select(-c(var)) %>% 
+  column_to_rownames("id") %>% 
+  pheatmap::pheatmap(scale = "row")
+```

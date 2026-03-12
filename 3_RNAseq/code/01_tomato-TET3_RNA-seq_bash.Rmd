@@ -1,0 +1,297 @@
+---
+title: "Tomato TET3 RNA-seq"
+subtitle: "_bash pipeline_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook:
+    theme: darkly
+    highlight: pygments
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    code_folding: "none"
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+# 0. Get data
+
+Place yourself in folder (name of your choice). You will need to run it again if you close the terminal
+```{bash}
+dir="/path/to/project/rnaseq" # double quotes important
+mkdir $dir
+```
+
+Make directories for analysis
+```{bash}
+cd $dir
+mkdir data data/1_raw data/2_trimmed data/3_mapped
+mkdir qa     qa/1_raw   qa/2_trimmed   qa/3_mapped
+```
+
+get data from `Shared210`
+```{bash}
+cp -vr /path/to/data/2018_12_05_RNA-seq_TET3/*.fastq.gz $dir/data/1_raw
+```
+
+The fastq files are single end 75bp
+
+Rename the files (create 2 vectors, original names and new names)
+```{bash}
+old_names=(JA1 JA2 JA5 JA6 JA7 JA8)
+new_names=(wt_1 wt_2 a4_1 a4_2 a17_1 a17_2)
+
+cd $dir/data/1_raw
+for ((i=0; i<${#old_names[@]}; i++)); do
+  mv ${old_names[$i]}_S?_R1_001.fastq.gz ${new_names[$i]}.R1.fq.gz ;
+done
+
+# new names 2024
+old_names=(wt_1 wt_2 a4_1 a4_2 a17_1 a17_2)
+new_names=(WT_1 WT_2 TET3_1 TET3_2 NTS_1 NTS_2)
+for ((i=0; i<${#old_names[@]}; i++)); do
+  mv ${old_names[$i]}.R1.fq.gz ${new_names[$i]}.R1.fq.gz ;
+done
+```
+
+# 1. Quality control with [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)
+
+The quality of the sequencing data was first checked with FastQC.
+```{bash}
+cd $dir
+fastqc -t 16 --quiet -o qa/1_raw/ data/1_raw/*fq.gz
+# aggregate results in one file
+multiqc --filename qa/1_raw/01_raw_FastQC_multiqc qa/1_raw
+```
+
+# 2. Trim with [Fastp](https://github.com/OpenGene/fastp#fastp)
+
+Trimming was performed with `fastp` with parameters `--cut_right --cut_window_size 4 --cut_mean_quality 20 --length_required 40 --overrepresentation_analysis`.
+```{bash}
+cd $dir/data/1_raw
+for i in *.R1.fq.gz; do
+  fastp --thread 16 --cut_right --cut_window_size 4 --cut_mean_quality 20 --length_required 40 \
+    --overrepresentation_analysis \
+    -i $i -o ../2_trimmed/${i/.R1./.R1.trimmed.} \
+    -h ../../qa/2_trimmed/${i%.R1.*}_fastp.html -j ../../qa/2_trimmed/${i%.R1.*}_fastp.json ;
+done
+wait
+# Multiqc reports of fastp
+cd $dir
+multiqc --filename qa/2_trimmed/02_trimmed_fastp_multiqc qa/2_trimmed -f
+```
+
+fastQC after trimming
+```{bash}
+cd $dir
+fastqc -t 16 --quiet -o qa/2_trimmed/ data/2_trimmed/*
+# aggregate results in one file
+multiqc --filename qa/2_trimmed/02_trimmed_FastQC_multiqc qa/2_trimmed
+```
+
+# 3. Mapping with [STAR](https://github.com/alexdobin/STAR)
+
+Before mapping or indexing, I add the transgene to the sequence and the gtf following Alex's example from HCPro. I explained this in the Tomato genome preparation Markdown.
+
+Set variables to fasta and gtf
+```{bash}}
+genome="/path/to/genome/v4_Mt_Pt_TET3/S_lycopersicum_chromosomes.4.00_Mt_Pt_TET3.fa" # double quotes important
+annotation="/path/to/genome/v4_Mt_Pt_TET3/ITAG4.1_gene_models_Mt_Pt_TET3.gtf" # double quotes important
+```
+
+## 3.1 Indexing
+
+Before mapping, an index of the reference needs to be created and saved on the disk:
+Index with STAR. (`--sjdbOverhangz` is your read length - 1). STAR need unzipped fasta. 
+```{bash}
+STAR --runMode genomeGenerate --runThreadN 24 --genomeDir $(dirname $genome) --genomeFastaFiles $genome --sjdbGTFfile $annotation --sjdbOverhang 74
+```
+
+I got this error
+> `!!!!! WARNING: --genomeSAindexNbases 14 is too large for the genome size=783127342, which may cause seg-fault at the mapping step. Re-run genome generation with recommended --genomeSAindexNbases 13` 
+
+So I rerun with that addition
+```{bash}
+STAR --runMode genomeGenerate --runThreadN 24 --genomeDir $(dirname $genome) --genomeFastaFiles $genome --sjdbGTFfile $annotation --sjdbOverhang 74 --genomeSAindexNbases 13
+```
+
+Make `chrom.sizes` file. Alternatively, STAR indexing generated the file `chrNameLength.txt` that is identical to the chrom.sizes I create here
+```{bash}
+samtools faidx $genome
+cut -f1,2 $genome.fai > ${genome%.fa*}.chrom.sizes
+```
+
+## 3.2 Mapping
+
+Mapping with STAR (Some problem with creating temporary FIFO files in the mountt, `--outTmpDir` to local vettel
+```{bash}
+cd $dir/data/2_trimmed
+time_file="../timing_mapping_STAR.tsv"
+printf "sample\tstart\tend\n" > $time_file
+for i in *R1.trimmed.fq.gz; do
+  printf "$i\t$(date '+%Y/%m/%d %H:%M:%S')\t" >> $time_file &&
+  STAR --runThreadN 12 --genomeDir $(dirname $genome) --readFilesIn $i \
+    --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --outFileNamePrefix ../3_mapped/${i/.R1.*/.} \
+    --outWigType bedGraph --outWigStrand Unstranded --quantMode GeneCounts --outTmpDir /path/to/project/tmp/${i/.R1.*/.} &&
+  printf "$(date '+%Y/%m/%d %H:%M:%S')\n" >> $time_file ;
+done
+```
+
+## 3.3 Cleaning up files
+
+After checking that everything worked fine, you can clean and move outputs from STAR. `.Log.out` & `.Log.progress.out` can be deleted, and `.Log.final.out` moved to `qa`. I also moved to `qa` the `SJ.out.tab` that contains the splice junctions informations, as I don't think I need it.  
+```{bash}
+cd $dir/data/3_mapped
+rm *.Log.out *.Log.progress.out # delete bad logs
+mv *.Log.final.out ../../qa/3_mapped # move good log to qa
+mkdir ../../qa/3_mapped/splice_junctions
+mv *.SJ.out.tab ../../qa/3_mapped/splice_junctions # move splice junctions to qa
+```
+
+```{bash}
+cd $dir/data/3_mapped
+rm *_Log.out *_Log.progress.out # delete bad logs
+mv *_Log.final.out ../../qa/3_mapped # move good log to qa
+mkdir ../../qa/3_mapped/splice_junctions
+mv *_SJ.out.tab ../../qa/3_mapped/splice_junctions # move splice junctions to qa
+```
+
+
+The files `.ReadsPerGene.out.tab` contain the counts, but the first 4 lines are `N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`, that are used by Multiqc to get statistics. Therefore I remove those out for the counts files with `tail -n +5` and move the whole file to qa.
+
+Also the counts files from STAR contain 4 columns: ID, reads unstranded, reads forward strand & reads reverse strand. We only want the first 2 columns as our RNA-seq method is unstranded. I had previously assumed that, when inputing counts files into DEseq2, it only takes the first 2 columns, but it turns out that it takes the first and the last (reads mapping to the reverse strand). This result in the counts for each gene being around half of what they should, and while it should change the results a lot, fixing it may increase the sensitivity of the results as we would have more data points. Therefore I only keep the first two columns of the count files with `cut -f 1,2`.
+
+```{bash}
+# move the counts data and split the stats
+mkdir ../4_counts 
+for i in *ReadsPerGene.out.tab; do
+  tail -n +5 $i | cut -f 1,2 > ../4_counts/${i/_ReadsPerGene.out.tab/.counts.unstranded.tsv} &&
+  mv $i ../../qa/3_mapped
+done
+```
+
+## 3.4 Multiqc of STAR
+
+```{bash}
+cd $dir/qa/3_mapped
+multiqc --filename 03_mapped_STAR_multiqc . -f
+```
+
+# 4. Generating tracks (bigwigs)
+## 4.1 STAR
+
+STAR can generate base-level resolution bedGraphs of coverage with options `--outWigType bedGraph --outWigStrand Unstranded`. It generates a file with the unique mappings and one with the multimappers as well. By default it uses RPM. Convert the bedGraph to bigwigs with `bedGraphToBigWig` and move them to 5_tracks with a sensible name. 
+```{bash}
+cd $dir/data/3_mapped
+mkdir ../5_tracks 
+for i in *.Signal.Unique.str1.out.bg; do
+  LC_COLLATE=C sort -k1,1 -k2,2n $i > $i.sorted &&
+  bedGraphToBigWig $i.sorted ${genome%.fa*}.chrom.sizes ../5_tracks/${i%.Signal.Unique.str1.out.bg}.unique.RPM.bw &&
+  LC_COLLATE=C sort -k1,1 -k2,2n ${i/.str1./Multiple.str1.} > $i.sorted &&
+  bedGraphToBigWig $i.sorted ${genome%.fa*}.chrom.sizes ../5_tracks/${i%.Signal.Unique.str1.out.bg}.all.RPM.bw &&
+  rm $i ${i/.str1./Multiple.str1.} $i.sorted ;
+done
+```
+
+## 4.2 [BAMscale](github.com/ncbi/BAMscale) 
+
+### Merge replicates
+
+To easier look at the data I will merge the BAM files for the replicas to get one bigwig file per genotype
+
+```{bash}
+cd $dir/data/3_mapped
+for i in *_1.Aligned.sortedByCoord.out.bam; do
+  samtools merge -@16 -o ${i/_1.Aligned.sortedByCoord.out./.merged.} ${i%_1.Aligned.sortedByCoord.out.bam}_*.bam -f 
+done
+```
+
+### BAMscale on RNA-seq mode
+
+BAMscale in `rna` mode will use 1 bp bins by default, if you set a bigget bin, it will still use smaller windows around splicing sites to show them accurately. It will generate a smaller file than STAR (as STAR uses 1 bp bin) and bigger than BamCoverage from Deeptools. It is way faster that BamCoverage. It scales the to 1x genome coverage by default, similar but not exactly the same as RPGC from Deeptools.
+```{bash}
+cd $dir/data/3_mapped
+for i in *.merged.bam; do
+  samtools index $i &&
+  BAMscale scale -t 16 --operation rna --binsize 10 --bam $i &&
+  mv $i.rna.bw ../5_tracks/${i/.bam/.scaled.bw}
+done
+```
+
+BAMscale can also compute the difference in coverage scaled, but it will create the scaled bigwig for each bam with a weird naming. I chose to rename and delete those (identical to the generated above).
+```{bash}
+cd $dir/data/3_mapped
+for i in a*.merged.bam; do
+  BAMscale scale -t 16 --binsize 10 --operation log2 --bam wt.merged.bam --bam $i &&
+  #rm $i.log2.bw wt.merged.bam.log2.bw &&
+  mv ${i}_vs_wt.merged.bam.log2.bw ../5_tracks/${i/.merged.bam/.scaled.log2.bw} ;
+done
+```
+
+Make logRPM bigwigs for visualisation in JBrowse
+```{r}
+library(plyranges)
+
+for (i in list.files(path = "data/5_tracks/", pattern = "*\\.RPM\\.bw")) {
+  bw = paste0("data/5_tracks/", i)
+  read_bigwig(bw) %>%
+    mutate(score = log10(score + 1)) %>%
+    write_bigwig(sub("\\.RPM\\.bw", "\\.logRPM\\.bw", bw))
+}
+```
+
+
+# 5. Adding tracks to JBrowse2
+
+Tracks generated by STAR with all mappings (unique and multiple) converted to log10(1+RPM) where added to [Darvi JBrowse](https://darvi.lnx.warwick.ac.uk/jbrowse2/?session=local-aPKcpslFZ)
+
+Copy files to JBrowse folders
+```{bash}
+cd $dir/data/5_tracks
+cp -v *.logRPM.bw /path/to/project/jbrowse/tet3/rnaseq/
+```
+
+Add the tracks to the config file
+```{bash}
+cd /var/www/html/jbrowse2
+darvi="https://darvi.lnx.warwick.ac.uk/data"
+folder="tet3/rnaseq"
+
+jbrowse add-track $darvi/$folder/wt_1.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "wt_1.all.logRPM", "name": "WT_1 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "wt_1.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(40,40,40,1)", "type": "XYPlotRenderer"}}}]}' -f
+
+jbrowse add-track $darvi/$folder/wt_2.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "wt_2.all.logRPM", "name": "WT_2 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "wt_2.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(40,40,40,1)", "type": "XYPlotRenderer"}}}]}' -f
+
+jbrowse add-track $darvi/$folder/a4_1.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "a4_1.all.logRPM", "name": "A4_1 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "a4_1.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(255,51,51)", "type": "XYPlotRenderer"}}}]}' -f
+
+jbrowse add-track $darvi/$folder/a4_2.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "a4_2.all.logRPM", "name": "A4_2 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "a4_2.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(255,51,51), "type": "XYPlotRenderer"}}}]}' -f
+
+jbrowse add-track $darvi/$folder/a17_1.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "a17_1.all.logRPM", "name": "A17_1 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "a17_1.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(51,153,255)", "type": "XYPlotRenderer"}}}]}' -f
+
+jbrowse add-track $darvi/$folder/a17_2.all.logRPM.bw -a tomato --category TET3,'RNA-seq' --config '
+  {"trackId": "a17_2.all.logRPM", "name": "A17_2 RNA-seq log(RPM+1)", "displays": [{
+ "displayId": "a17_2.all.logRPM", "minScore": 0, "maxScore": 1.6, "type":"LinearWiggleDisplay", 
+ "renderers": {"XYPlotRenderer": {"posColor": "rgb(51,153,255)", "type": "XYPlotRenderer"}}}]}' -f
+```
+
+

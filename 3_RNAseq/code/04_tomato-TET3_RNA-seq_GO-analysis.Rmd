@@ -1,0 +1,321 @@
+---
+title: "GO analysis DEGs TET3"
+author: "Javier Antúnez Sánchez"
+output: rmdformats::readthedown
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE, echo = FALSE)
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(gprofiler2)
+```
+
+Read Differentially Expressed Genes list
+```{r}
+DEGs_vsd_p01_lfc1 <- readRDS(file = "../data/6_degs/DEGs.RDS")
+
+kbl(DEGs_vsd_p01_lfc1$A4_vs_WT) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+## Gene Ontology {.tabset}
+
+```{r}
+# Function to get GO for tomato from DEGs lists
+gost_tom <- function(query, name = deparse(substitute(query))) {
+  lst <- list(query$id %>% str_remove("gene:"))
+  names(lst) = name
+  gost(query = lst, organism = 'slycopersicum', significant = F, user_threshold = 0.01)
+}
+
+#Function to display table of GO terms
+go_kable <- function(go) {
+  go$result %>%
+    dplyr::select(term_name, term_id, source, p_value) %>% 
+    mutate(log10_pv = log10(p_value) %>% round()) %>%
+    kbl() %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+    scroll_box(width = "650px", height = "300px", fixed_thead = TRUE)
+}
+
+
+# Generate list of GO results
+go <- list()
+go$A4_vs_WT <- list()
+go$A4_vs_WT$all  <- gost_tom(query = DEGs_vsd_p01_lfc1$A4_vs_WT, name = "DEGs A4 vs WT")
+go$A4_vs_WT$up   <- gost_tom(query = DEGs_vsd_p01_lfc1$A4_vs_WT %>% filter(log2FoldChange > 0), name = "DEGs A4 vs WT Up")
+go$A4_vs_WT$down <- gost_tom(query = DEGs_vsd_p01_lfc1$A4_vs_WT %>% filter(log2FoldChange < 0), name = "DEGs A4 vs WT Down")
+go$A17_vs_WT <- list()
+go$A17_vs_WT$all  <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_WT, name = "DEGs A17 vs WT")
+go$A17_vs_WT$up   <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_WT %>% filter(log2FoldChange > 0), name = "DEGs A17 vs WT Up")
+go$A17_vs_WT$down <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_WT %>% filter(log2FoldChange < 0), name = "DEGs A17 vs WT Down")
+go$A17_vs_A4 <- list()
+go$A17_vs_A4$all  <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_A4, name = "DEGs A17 vs A4")
+go$A17_vs_A4$up   <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_A4 %>% filter(log2FoldChange > 0), name = "DEGs A17 vs A4 Up")
+go$A17_vs_A4$down <- gost_tom(query = DEGs_vsd_p01_lfc1$A17_vs_A4 %>% filter(log2FoldChange < 0), name = "DEGs A17 vs A4 Down")
+```
+
+
+### A4 vs WT {.tabset}
+
+#### all {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$all, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$all, capped = FALSE, interactive = TRUE)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler))
+```{r}
+go_kable(go$A4_vs_WT$all)
+```
+
+#### up {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$up, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$up, capped = FALSE, interactive = TRUE)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler))
+```{r}
+go_kable(go$A4_vs_WT$up)
+```
+
+#### down {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$down, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A4_vs_WT$down, capped = FALSE, interactive = TRUE)
+```
+
+```{r include=FALSE}
+publish_gostplot(p = gostplot(go$A4_vs_WT$down, capped = FALSE, interactive = FALSE),
+                 highlight_terms = go$A4_vs_WT$down$result %>%
+                   filter(p_value < 0.05) %>% 
+                   pull(term_id),
+                 filename = "../figures/GO_AT1-TET3-vs-WT_downregulated.pdf", width = 8, height = 6)
+```
+
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler/))
+```{r}
+go_kable(go$A4$down)
+```
+
+### A17 vs WT {.tabset}
+#### all {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$all, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$all, capped = FALSE, interactive = TRUE)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler))
+```{r}
+go_kable(go$A17_vs_WT$all)
+```
+
+#### up {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$up, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$up, capped = FALSE, interactive = TRUE)
+```
+
+```{r, include=FALSE}
+publish_gostplot(p = gostplot(go$A17_vs_WT$up, capped = FALSE, interactive = FALSE), 
+                 highlight_terms = go$A17_vs_WT$up$result %>%
+                   filter(p_value < 1e-10) %>% 
+                   pull(term_id),
+                 filename = "../figures/GO_AT1-NT-vs-WT_upregulated.pdf", width = 8, height = 11)
+```
+
+
+##### table
+
+Table of GO terms 
+
+```{r}
+go_kable(go$A17_vs_WT$up)
+```
+
+#### down {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$down, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_WT$down, capped = FALSE, interactive = TRUE)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler/))
+```{r}
+go_kable(go$A17_vs_WT$down)
+```
+
+
+
+
+### A17 vs A4 {.tabset}
+#### all {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$all, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$all, capped = FALSE, interactive = TRUE)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler))
+```{r}
+go_kable(go$A17_vs_A4$all)
+```
+
+#### up {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$up, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$up, capped = FALSE, interactive = TRUE)
+```
+
+```{r, include=FALSE}
+publish_gostplot(p = gostplot(go$A17_vs_A4$up, capped = FALSE, interactive = FALSE), 
+                 highlight_terms = go$A17_vs_A4$up$result %>%
+                   filter(p_value < 1e-7) %>% 
+                   pull(term_id),
+                 filename = "../figures/GO_AT1-NT-vs-AT1-TET3_upregulated-.pdf", width = 8, height = 12)
+```
+
+
+##### table
+
+Table of GO terms 
+
+```{r}
+go_kable(go$A17_vs_A4$up)
+```
+
+#### down {.tabset}
+
+##### capped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$down, capped = TRUE, interactive = TRUE)
+```
+
+##### uncapped
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$A17_vs_A4$down, capped = FALSE, interactive = TRUE)
+```
+
+```{r include=FALSE}
+publish_gostplot(p = gostplot(go$A17_vs_A4$down, capped = FALSE, interactive = FALSE),
+                 highlight_terms = go$A17_vs_A4$down$result %>%
+                   filter(p_value < 0.01) %>% 
+                   pull(term_id),
+                 filename = "../figures/GO_AT1-NT-vs-AT1-TET3_downregulated.pdf", width = 8, height = 4)
+```
+
+##### table
+
+Table of GO terms ([detailed table on gProfiler web](https://biit.cs.ut.ee/gprofiler/))
+```{r}
+go_kable(go$A17_vs_A4$down)
+```
+
+# Intersections {.tabset}
+
+```{r}
+DEGs_TET3_down_NT_up <- inner_join(DEGs_vsd_p01_lfc1$A17_vs_WT %>% filter(log2FoldChange > 0),
+                                   DEGs_vsd_p01_lfc1$A4_vs_WT %>% filter(log2FoldChange < 0),
+                                   by = join_by(id, WT_1, WT_2, A4_1, A4_2, A17_1, A17_2), suffix = c("_TET3", "_NT"))
+
+ids_DEGs_TET3_down_NT_up <- DEGs_TET3_down_NT_up %>% pull(id)
+
+write_lines(ids_DEGs_TET3_down_NT_up, file = "../data/6_degs/Gene-IDs_intersection-TET3-down-NT-up.txt")
+
+go$TET3_down_NT_up <- gost_tom(query = DEGs_TET3_down_NT_up, name = "Intersection DEGs TET3 down with NT up")
+```
+
+```{r fig.height=4, fig.width=8}
+gostplot(go$TET3_down_NT_up, capped = FALSE, interactive = TRUE)
+```
+
+```{r include=FALSE}
+publish_gostplot(p = gostplot(go$TET3_down_NT_up, capped = FALSE, interactive = FALSE),
+                 highlight_terms = go$TET3_down_NT_up$result %>%
+                   filter(p_value < 0.05) %>% 
+                   pull(term_id),
+                 filename = "../figures/GO_intersection-AT1-TET3-down-NT-up.pdf", width = 8, height = 4)
+```

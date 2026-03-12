@@ -1,0 +1,114 @@
+---
+title: "PCAs of mC in 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq screening test_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+```
+
+# Load data
+
+I filter out the samples that contain less than 14 Million Cytosines covered (WT_6, A_1, A_12, B_6, B_11, B_5, B1_2, B2_14, B2_18 & B2_20) as outliers as explained in the bins PCA report. 
+
+```{r}
+# Read matrix
+bins_wide_table_filtered <- read_tsv("../data/4_methylation/tomato_tet3_screening.mC_bins.100kbp.wide.tsv", show_col_types = FALSE) %>%
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14)) %>% 
+  select(chr:context, WT_1, WT_2, WT_3, WT_4, B_2, B_3, B_4, B_8, B_10, B1_3, B1_6, B1_7, B1_8, B1_9, B2_1, B2_5, B2_9, B2_10, B2_16)
+```
+
+# Compute inheritance
+
+Calculate the difference in methylation between B T1 and B T2- for CG. Threshold defined as 5% loss.
+
+```{r}
+ctx <- "CG"         # "CG", "CHG", "CHH"
+delta_thr <- -5     # percentage points
+
+wt_cols  <- c("WT_1","WT_2","WT_3","WT_4")
+bt1_cols <- c("B_2","B_3","B_4","B_8","B_10")
+bt2m_cols <- c("B1_3","B1_6","B1_7","B1_8","B1_9")  # B_T2- non-transgenic sibs is actualy B1 in this nomenclature 
+
+bins_ctx <- bins_wide_table_filtered %>%
+  filter(context == ctx) %>%
+  mutate(
+    mWT  = rowMeans(across(all_of(wt_cols)),  na.rm = TRUE),
+    mT1  = rowMeans(across(all_of(bt1_cols)), na.rm = TRUE),
+    mT2m = rowMeans(across(all_of(bt2m_cols)), na.rm = TRUE),
+    dT1  = mT1  - mWT,   # Δ(T1 - WT), in % units
+    dT2m = mT2m - mWT    # Δ(T2- - WT)
+  )
+
+# Define T1-affected bins and "propagated" bins (directional stability)
+t1_affected <- bins_ctx %>%
+  filter(dT1 <= delta_thr)
+
+prop_stats <- t1_affected %>%
+  summarise(
+    n_bins = n(),
+    propagated_n = sum(dT2m <= delta_thr, na.rm = TRUE),
+    propagated_frac = propagated_n / n_bins,
+    spearman_rho = cor(dT1, dT2m, method = "spearman", use = "pairwise.complete.obs"),
+    pearson_r = cor(dT1, dT2m, method = "pearson", use = "pairwise.complete.obs"),
+    median_retention = median(dT2m/dT1, na.rm = TRUE) # effect retention ratio; interpret with care
+  )
+
+prop_stats
+```
+
+Calculate how many bins retain at least 50% of the demethylation magnitude.
+
+```{r retention-metric}
+alpha <- 0.5  # retains at least 50% of the demethylation magnitude
+
+t1_affected %>%
+  summarise(
+    retains50_n = sum(dT2m <= alpha * dT1, na.rm = TRUE),
+    retains50_frac = retains50_n / n()
+  )
+```
+
+Make a plot to illustrate this.
+
+```{r inheritance-scatter, fig.height=5, fig.width=5}
+ggplot(t1_affected, aes(x = dT1, y = dT2m)) +
+  geom_point(alpha = 0.25, size = 0.7, shape = 16) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  geom_vline(xintercept = delta_thr, linetype = "dashed", color = "red3") +
+  geom_hline(yintercept = delta_thr, linetype = "dashed", color = "red3") +
+  geom_hline(yintercept = delta_thr/2, linetype = "dashed", color = "red3", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(x = paste0("diff m", ctx, " (B_T1 - WT) in 100 kb bins (%)"),
+       y = paste0("diff m", ctx, " (B_T2- - WT) in 100 kb bins (%)"),
+       title = paste0("Stability of ", ctx, " loss from B_T1 to B_T2-"),
+       subtitle = paste0("Bins defined as T1-affected: diff <= ", delta_thr, " %")) +
+  coord_cartesian(xlim = c(-21, NA))
+
+#ggsave2("../figures/mC_bins/inheritance-CG.pdf", height=5, width=5)
+```

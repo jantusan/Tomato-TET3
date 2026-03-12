@@ -1,0 +1,310 @@
+---
+title: "Genome plots 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq selected plants_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(patchwork)
+library(slider)
+library(ggforce)
+library(scales)
+
+# Functions
+
+## Function to plot chr as facets in ggplot
+facet_chr <- function(chr = chr, rows = NULL, scales = "free_x", space = "free_x", breaks = 40e6, switch = NULL) {
+  list(facet_grid(rows = vars({{ rows }}), cols = vars({{ chr }}), scales = scales, space = space, switch = switch),
+       scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(breaks), 
+                          labels = label_number(scale_cut = cut_short_scale())),
+       xlab("Genomic coordinates (bp)"))
+}
+
+## Data and Function to create heterochromatin ribbon
+heterochromatin_H3K27ac = read_tsv("/path/to/genome/SL4.0_heterochromatin_H3K27ac_chXX.bed", col_names = c("chr","start","end"), col_types = cols()) %>% 
+  mutate(chr = str_c("SL4.0", chr))
+
+SL4_chrs <- str_c("SL4.0ch", str_pad(c(1:8, 10:12), 2, pad = "0"))
+
+geom_heterochromatin <- function(hchrom = heterochromatin_H3K27ac, chr_col = chr, chrs = SL4_chrs) {
+  hchrom <- dplyr::rename(hchrom, {{ chr_col }} := chr)
+  list(geom_rect(data = hchrom %>% filter(chr %in% chrs),
+                 aes(x = NULL, y = NULL, xmin = start, xmax = end, ymin = -Inf, ymax = Inf), 
+                 color = NA, fill = "black", alpha = 0.1))
+}
+```
+
+# Load data
+
+```{r read-sample-table}
+sample_table <- read_tsv("../data/sample_table.tsv", col_types = cols()) %>% 
+  mutate(sample = fct_inorder(sample),
+         condition = fct_inorder(condition),
+         replica = as_factor(replica),
+         description = fct_inorder(description))
+```
+
+```{r load-merged-bins}
+bins_long_table_merged <- read_tsv("../data/4_methylation/tomato_tet3_selected.mC_bins.100kbp.merged.tsv", col_types = cols()) %>% 
+  # order the samples as a factor and add description
+  mutate(sample = factor(sample, levels = c("WT", "A4", "A17")),
+         description = case_when(sample == "WT" ~ "WT", 
+                                 sample == "A4" ~ "A.T1\nTET3", 
+                                 sample == "A17" ~ "A.T1\nNT") %>% 
+           fct_inorder())
+```
+
+```{r pivot-bins}
+bins_wide_table_merged <- bins_long_table_merged %>% 
+  pivot_wider(id_cols = chr:context, names_from = sample, values_from = mR, names_sort = TRUE)
+```
+
+```{r aesthetic-variables}
+# Aesthetics to plot
+sample_colors <- c(WT  = "grey40", A4  = "tomato2", A17 = "slateblue2")
+description_colors <- c(WT  = "grey40", "A.T1\nTET3" = "tomato2", "A.T1\nNT" = "slateblue2")
+```
+
+```{r sliding-functions}
+# Function to pivot a wide methylation table while comparing to a reference
+pivot_longer_diff_to_reference <- function(bins_wide, reference = WT_mean, values = mR) {
+  bins_wide %>%
+    dplyr::rename(ref = {{ reference }}) %>%
+    pivot_longer(-c(chr:context,ref), names_to = "sample", values_to = as.character(ensym(values)),
+                 names_transform = list(sample = forcats::fct_inorder)) %>%
+    mutate(diff = {{ values }} - ref)
+}
+
+# Function to compute sliding function at the middle point of a window
+slide_dbl_midwindow <- function(.x, .f, window = 100, ...) {
+  slide_dbl(.x, ~.f(.x, na.rm = T), ...,  
+            .before = ceiling(window / 2) - 1, # to account for the middle point 
+            .after = floor(window / 2))        # otherwise the real window size would be window + 1
+}
+
+# for some reasons I cannot combine the above function with the embrace operator {{, so I create these:
+slide_dbl_midwindow_mean <- function(.x, window = 100, ...) {
+  slide_dbl_midwindow(.x, .f = mean, window = window, ...)
+}
+
+slide_dbl_midwindow_median <- function(.x, window = 100, ...) {
+  slide_dbl_midwindow(.x, .f = median, window = window, ...)
+}
+
+# Function to compute moving averages (updated, window split before and after)
+compute_sliding_stats <- function(bins_long_with_diff, values = mR, window = 100) {
+  bins_long_with_diff %>% 
+    arrange(sample, chr, context, start) %>%
+    group_by(sample, chr, context) %>%
+    mutate(mean        = slide_dbl_midwindow_mean(.x    = {{ values }}, window = window),
+           median      = slide_dbl_midwindow_median(.x = {{ values }}, window = window),
+           mean_diff   = slide_dbl_midwindow_mean(.x   = diff,         window = window),
+           median_diff = slide_dbl_midwindow_median(.x = diff,         window = window)) %>% 
+  ungroup()
+}
+```
+
+Compute the sliding binned data for 20 bins of 100kpb, or 2 Mbp
+
+```{r}
+bins_long_table_sliding_2Mbp <- bins_wide_table_merged %>%
+  mutate(WT_mean = WT) %>%
+  pivot_longer_diff_to_reference() %>% 
+  compute_sliding_stats(values = mR, window = 20) %>% 
+  # order the samples as a factor and add description
+  mutate(sample = factor(sample, levels = c("WT", "A4", "A17")),
+         description = case_when(sample == "WT" ~ "WT", 
+                                 sample == "A4" ~ "A.T1\nTET3", 
+                                 sample == "A17" ~ "A.T1\nNT") %>% 
+           fct_inorder())
+```
+
+## Correlation WT mC to change
+
+```{r fig.width=7, fig.height=6, warning=FALSE}
+hchrom_H3K27ac_100kbp_bins <- read_tsv("/path/to/genome/SL4.0_heterochromatin_100kbp_bins_H3K27ac_chXX.tsv",
+                                       show_col_types = FALSE) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames),
+         start = start - 1) %>% 
+  dplyr::rename(chr = seqnames)
+
+bins_long_table_sliding_2Mbp %>% 
+  left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+  filter(!is.na(chromatin),
+         sample != "WT") %>% 
+  ggplot(aes(ref, diff, color = chromatin)) +
+  facet_grid(rows = vars(sample), cols = vars(context)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(shape = 16, size = 0.5, alpha = 0.5) +
+  scale_color_brewer(palette = "Set1") +
+  coord_cartesian(ylim = c(-15, 4)) +
+  labs(title = "Methylation differences of TET3 plants compared to WT", 
+       x = "% mC in WT", y = "% mC difference to WT",
+       subtitle = "using averages over 100 kbp bins") +
+  theme(axis.line=element_blank(), strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour="black", linewidth=1, fill=NA), legend.position = "bottom",
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+  
+ggsave2("../figures/mC_bins/correlation-mC-loss-to-WT.pdf", width = 7, height = 6)
+```
+
+
+## Genome plots
+
+```{r plot function meth}
+plot_genome <- function(data, y, chr_col = chr, scales = "free", chrs = SL4_chrs, breaks = 20e6, points = FALSE, y_points = NULL) {
+  data %>%
+    filter({{ chr_col }} %in% chrs) %>%
+    ggplot(aes(x = start, y = {{ y }}, color = description)) +
+    facet_chr(chr = {{ chr_col }}, rows = context, scales = scales, space = "free_x", breaks = breaks) +
+    geom_heterochromatin(chrs = chrs) +
+    scale_y_continuous(expand = expansion(mult = 0.05), limits = c(NA, NA)) +
+    { if(points) geom_point(aes(y = {{ y_points }}), shape = 16, size = 1, alpha = 0.3) } +
+    geom_line(aes(group = sample)) +
+    scale_color_manual("Sample", values = description_colors)  +
+    theme_cowplot() +
+    theme(panel.spacing.x=unit(0.5, "lines"),
+          strip.background.y = element_rect(colour = NA, fill = "papayawhip"), strip.background.x = element_blank(),
+          panel.border = element_rect(colour = "black", linewidth = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5),
+          legend.position = "bottom", axis.title.x = element_blank())
+}
+```
+
+### Whole genome {.tabset .tabset-pills}
+
+#### Mean
+
+```{r fig.height=6, fig.width=12}
+plot_genome(bins_long_table_sliding_2Mbp, y = mean) +
+  labs(title = "DNA Methylation across Tomato chromosomes",
+       subtitle = "Sliding window of 2Mbp. Shaded region represents Heterochromatin",
+       y = "% mC (mean)")
+
+ggsave2("../figures/genome_plots/genome-plot-mR.pdf", width = 16, height = 8)
+```
+
+#### Median
+
+```{r fig.height=6, fig.width=12}
+plot_genome(bins_long_table_sliding_2Mbp, y = median) +
+  labs(title = "DNA Methylation across Tomato chromosomes ",
+       subtitle = "Sliding window of 2Mbp. Shaded region represents Heterochromatin",
+       y = "% mC (median)")
+```
+
+#### Mean diff
+
+```{r fig.height=6, fig.width=12}
+bins_long_table_sliding_2Mbp  %>% 
+  filter(sample != "WT") %>% 
+  plot_genome(y = mean_diff) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey20") +
+  labs(title = "DNA Methylation across Tomato chromosomes",
+       subtitle = "Sliding window of 2Mbp. Shaded region represents Heterochromatin",
+       y = "% mC difference to WT (mean)")
+
+ggsave2("../figures/genome_plots/genome-plot-diff.pdf", width = 16, height = 8)
+```
+
+#### Median diff
+
+```{r fig.height=6, fig.width=12}
+bins_long_table_sliding_2Mbp  %>% 
+  filter(sample != "WT") %>% 
+  plot_genome(y = median_diff) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey20") +
+  labs(title = "DNA Methylation across Tomato chromosomes",
+       subtitle = "Sliding window of 2Mbp. Shaded region represents Heterochromatin",
+       y = "% mC difference to WT (median)")
+```
+
+### Chromosome 2 {.tabset .tabset-pills .active}
+
+#### Mean
+
+```{r fig.height=7, fig.width=5}
+plot_genome(bins_long_table_sliding_2Mbp, y = mean, chrs = "SL4.0ch02", points = TRUE, y_points = mR, breaks = 10e6) +
+  geom_line(aes(group = sample), linewidth = 0.7) +
+  labs(title = "DNA Methylation on Chromosome 2",
+       subtitle = "Dots represent average for 100 kbp bins
+Line represents moving average across 2 Mbp (mean)
+Shaded region represents Heterochromatin",
+       y = "% mC") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1), axis.title.x = element_text(angle = 0)) 
+
+ggsave2("../figures/genome_plots/genome-plot-ch02-mR.pdf", width = 5, height = 7)
+```
+
+#### Median
+
+```{r fig.height=7, fig.width=5}
+plot_genome(bins_long_table_sliding_2Mbp, y = median, chrs = "SL4.0ch02", points = TRUE, y_points = mR, breaks = 10e6) +
+  geom_line(aes(group = sample), linewidth = 0.7) +
+  labs(title = "DNA Methylation on Chromosome 2",
+       subtitle = "Dots represent average for 100 kbp bins
+Line represents moving average across 2 Mbp (median)
+Shaded region represents Heterochromatin",
+       y = "% mC") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1), axis.title.x = element_text(angle = 0)) 
+```
+
+#### Mean diff {.active}
+
+```{r fig.height=7, fig.width=5}
+bins_long_table_sliding_2Mbp  %>% 
+  filter(sample != "WT") %>% 
+  plot_genome(y = mean_diff, chrs = "SL4.0ch02", points = TRUE, y_points = diff, breaks = 10e6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey20") +
+  geom_line(aes(group = sample), linewidth = 0.7) +
+  labs(title = "DNA Methylation on Chromosome 2",
+       subtitle = "Dots represent average for 100 kbp bins
+Line represents moving average across 2 Mbp
+Shaded region represents Heterochromatin",
+       y = "% mC difference to WT ") +
+  guides(color = guide_legend(keyheight = 2.3)) +
+  theme(legend.position = c(0.73, 0.45), legend.text.align = 0.5, legend.title = element_blank(),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1), axis.title.x = element_text(angle = 0)) 
+
+ggsave2("../figures/genome_plots/genome-plot-ch02-diff.pdf", width = 5, height = 7)
+```
+
+#### Median diff {.active}
+
+```{r fig.height=7, fig.width=5}
+bins_long_table_sliding_2Mbp  %>% 
+  filter(sample != "WT") %>% 
+  plot_genome(y = median_diff, chrs = "SL4.0ch02", points = TRUE, y_points = diff, breaks = 10e6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey20") +
+  geom_line(aes(group = sample), linewidth = 0.7) +
+  labs(title = "DNA Methylation on Chromosome 2",
+       subtitle = "Dots represent average for 100 kbp bins
+Line represents moving average across 2 Mbp (median)
+Shaded region represents Heterochromatin",
+       y = "% mC difference to WT ") +
+  guides(color = guide_legend(keyheight = 2.3)) +
+  theme(legend.position = c(0.73, 0.45), legend.text.align = 0.5, legend.title = element_blank(),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1), axis.title.x = element_text(angle = 0)) 
+```
+

@@ -1,0 +1,219 @@
+---
+title: "Scatter plots of mC and coverage in 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq selected plants_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook:
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(scales)
+```
+
+Create sample table
+
+```{r create-sample-table}
+(sample_table <- list(sample = c("WT", "A4", "A17"), replica = c(1, 2)) %>%
+  expand_grid(!!!.) %>%  
+  pmap_chr(paste, sep = "_") %>%
+  tibble(sample = .) %>%
+   mutate(condition = str_remove(sample, "_[:digit:]") %>% factor(levels = c("WT", "A4", "A17")),
+          replica = str_remove(sample, ".*_") %>% as_factor()) %>%
+   arrange(condition, replica) %>% 
+   mutate(description = c("WT", "WT", "A.T1 TET3", "A.T1 TET3", "A.T1 NT", "A.T1 NT")))
+
+write_tsv(sample_table, "../data/sample_table.tsv")
+```
+
+```{r read-sample-table}
+sample_table <- read_tsv("../data/sample_table.tsv", col_types = cols()) %>% 
+  mutate(sample = fct_inorder(sample),
+         condition = fct_inorder(condition),
+         replica = as_factor(replica),
+         description = fct_inorder(description))
+```
+
+# Load data
+
+When loading data we filter chromosome 9 as there is an anomaly in the mapping (and extranuclear genomes).
+
+```{r load-bins}
+bins_long_table <- read_tsv("../data/4_methylation/tomato_tet3_selected.mC_bins.100kbp.tsv", col_types = cols()) %>% 
+  # remove ch09 with the anomaly and organelle genomes
+  filter(!(chr %in% c("SL4.0ch09", "Mt", "Pt"))) %>% 
+  # join with sample table
+  mutate(sample = toupper(sample)) %>% 
+  left_join(sample_table, by = "sample") %>% 
+  # order the samples as a factor
+  mutate(sample = factor(sample, levels = c("WT_1", "WT_2", "A4_1", "A4_2", "A17_1", "A17_2")))
+```
+
+```{r pivot-bins}
+bins_wide_table <- bins_long_table %>% 
+  pivot_wider(id_cols = chr:context, names_from = sample, values_from = mR, names_sort = TRUE)
+```
+
+```{r eval=FALSE}
+# Write matrix for future loading
+write_tsv(bins_wide_table, "../data/4_methylation/tomato_tet3_selected.mC_bins.100kbp.wide.tsv")
+```
+
+```{r eval=FALSE}
+# Read matrix
+bins_wide_table <- read_tsv("../data/4_methylation/tomato_tet3_selected.mC_bins.100kbp.wide.tsv", show_col_types = FALSE)
+```
+
+```{r aesthetic-variables}
+# Aesthetics to plot the PCA and other plots
+sample_colors <- c(WT  = "grey40", A4  = "tomato2", A17 = "slateblue2")
+
+replica_colors <- c(WT_1  = "grey60", WT_2  = "grey30", 
+                    A4_1  = "tomato1", A4_2  = "tomato3", 
+                    A17_1 = "slateblue1", A17_2 = "slateblue3")
+
+replica_shapes <- c("1" = 21, "2" = 24)
+```
+
+# Coverage check
+
+Some quality check for the coverage levels of these 100 kbp bins
+
+## Raincloud plot of coverage
+
+```{r fig.width=11, fig.height=5}
+bins_long_table %>% 
+  mutate(coverage = reads_m + reads_n) %>% 
+  ggplot(aes(y = coverage, x = sample, fill = condition)) + 
+  facet_grid(cols = vars(context), scales = "free", space = "free_x") +
+  ggdist::stat_halfeye(adjust = .5, width = .6, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .15, outlier.shape = NA, color = 1) +
+  gghalves::geom_half_point(side = "l", shape = 16, size = 0.2, alpha = 0.2, range_scale = .4) +
+  scale_fill_manual(values = sample_colors) + 
+  scale_y_continuous(trans = "pseudo_log", breaks = c(2000, 5000, 10000, 20000, 50000, 100000, 200000),
+                     labels = label_number(scale_cut = cut_short_scale())) +
+  coord_cartesian(ylim = c(2000, 200000)) +
+  labs(title = "Cytosine coverage for 100 kbp bins", 
+       subtitle = "Sample A4_1 has a much wider distribution than the rest") +
+  theme(axis.line=element_blank(), strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), legend.position = "none",
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+
+ggsave(filename = "../figures/mC_bins/coverage-100kbp-raincloud.pdf", height = 5, width = 11)
+```
+
+## scatter plot coverage vs %mC
+
+```{r fig.width=9, fig.height=7}
+bins_long_table %>% 
+  mutate(coverage = reads_m + reads_n) %>% 
+  ggplot(aes(coverage, mR, color = context)) +
+  facet_grid(cols = vars(condition), rows = vars(replica), scales = "free") +
+  geom_point(shape = 16, size = 0.5, alpha = 0.3) +
+  scale_x_continuous(trans = "pseudo_log", breaks = c(2000, 5000, 10000, 20000, 50000, 100000, 200000),
+                     labels = label_number(scale_cut = cut_short_scale())) +
+  coord_cartesian(xlim = c(2000, 200000)) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 0.7))) +
+  labs(title = "Cytosine coverage for 100 kbp bins vs %mC", y = "%mC", 
+       subtitle = "No clear correlation, which is a good sign") +
+  theme(axis.line=element_blank(), strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), legend.position = "bottom",
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+```
+
+# Scatter plots {.tabset}
+
+```{r}
+scatter_matrix <- function(bins, condition, context = "C", title = str_c("Scatter plot of %m", context, " from ", condition)) {
+  ctx <- context
+  bins %>%
+    select(chr:context, starts_with(condition)) %>%
+    filter(str_detect(context, ctx)) %>%
+    add_column(slope = 1) %>% 
+    add_column(intercept = 0) %>% 
+    na.omit() %>% 
+    ggplot(aes(x = .panel_x, y = .panel_y)) +
+    geom_point(shape = 16, size = 0.3, alpha = 0.5) +
+    geom_point(shape = 16, size = 0, alpha = 0) +
+    geom_density_2d_filled(contour_var = "ndensity") +
+    geom_abline(aes(intercept = intercept, slope = slope), color = "red", alpha = 0.5) +
+    geom_autodensity(color = 1, fill = 3) +
+    facet_matrix(vars(-c(chr:context, slope, intercept)), layer.upper = c(1,4), layer.lower = c(2,3,4), layer.diag = 5) +
+    theme(axis.line = element_blank(), panel.border = element_rect(colour = "black", linewidth = 1, fill = NA), 
+        strip.background = element_blank(), plot.title = element_text(hjust = 0.5), legend.position = "none") +
+    ggtitle(title)
+}
+```
+
+```{r fig.height=14, fig.width=12}
+(scatter_matrix_bins <- scatter_matrix(bins_wide_table, "WT",  context = "CG",  title = "WT %mCG") +
+   scatter_matrix(bins_wide_table, "WT",  context = "CHG", title = "WT %mCHG") +
+   scatter_matrix(bins_wide_table, "WT",  context = "CHH", title = "WT %mCHH") +
+   scatter_matrix(bins_wide_table, "A4",  context = "CG",  title = "A4 %mCG") +
+   scatter_matrix(bins_wide_table, "A4",  context = "CHG", title = "A4 %mCHG") +
+   scatter_matrix(bins_wide_table, "A4",  context = "CHH", title = "A4 %mCHH") +
+   scatter_matrix(bins_wide_table, "A17", context = "CG",  title = "A17 %mCG") +
+   scatter_matrix(bins_wide_table, "A17", context = "CHG", title = "A17 %mCHG") +
+   scatter_matrix(bins_wide_table, "A17", context = "CHH", title = "A17 %mCHH") +
+   plot_annotation(title = "Scatter plots of %mC for 100 kbp bins by context",
+                   subtitle = "diagonal of the matrix represents distribution of methylation values \nbottom half show density plot of methylation values",
+                   caption = "Disclaimer: y axis on diagonal matrix (histograms) doesn't match the axis labels")) 
+
+ggsave(filename = "../figures/mC_bins/scatter-100kbp-matrices.pdf", plot = scatter_matrix_bins, height = 14, width = 12)
+```
+
+From all the Scatter plots it seems clear that something is wrong with sample A4_1. It has higher methylation than all the other samples for those bins with intermediate levels of %mC. As this is across all the genome and it is not seen in the other replica of A4, it is probably a technical problem rather than biological.
+
+## CG
+
+```{r fig.height=10, fig.width=9}
+scatter_matrix(bins_wide_table, c("W", "A"), "CG", title = "") +
+   labs(title = "Scatter plots of %mCG for 100 kbp bins",
+        subtitle = "diagonal of the matrix represents distribution of methylation values \nbottom half show density plot of methylation values",
+        caption = "Disclaimer: y axis on diagonal matrix (histograms) doesn't match the axis labels") 
+
+ggsave(filename = "../figures/mC_bins/scatter-100kbp-matrix-all-CG.pdf", height = 13, width = 12)
+```
+
+## CHG
+
+```{r fig.height=10, fig.width=9}
+scatter_matrix(bins_wide_table, c("W", "A"), "CHG", title = "") +
+   labs(title = "Scatter plots of %mCHG for 100 kbp bins",
+        subtitle = "diagonal of the matrix represents distribution of methylation values \nbottom half show density plot of methylation values",
+        caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels") 
+
+ggsave(filename = "../figures/mC_bins/scatter-100kbp-matrix-all-CHG.pdf", height = 13, width = 12)
+```
+
+## CHH
+
+```{r fig.height=10, fig.width=9}
+scatter_matrix(bins_wide_table, c("W", "A"), "CHH", title = "") +
+   labs(title = "Scatter plots of %mCHH for 100 kbp bins",
+        subtitle = "diagonal of the matrix represents distribution of methylation values \nbottom half show density plot of methylation values",
+        caption = "Disclaimer: y axis on diagonal matrix doesn't match the axis labels") 
+
+ggsave(filename = "../figures/mC_bins/scatter-100kbp-matrix-all-CHH.pdf", height = 13, width = 12)
+```

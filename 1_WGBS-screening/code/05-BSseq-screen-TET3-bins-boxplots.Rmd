@@ -1,0 +1,702 @@
+---
+title: "Boxplots of mC in 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq screening test_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(patchwork)
+library(ggbeeswarm)
+library(scales)
+```
+
+
+# Load and filter data
+
+When loading data I filter samples Undetermined (reads that couldn't be assigned to any library), neg, PBS (controls), A1_2 & B2_13 (samples with almost no reads). I also filter extranuclear genomes (Mitochondrion and Chloroplast) and chromosome 9 as there is an anomaly in the mapping.
+
+```{r load-bins}
+bins_long_table <- read_tsv("../data/4_methylation/tomato_tet3_screening.mC_bins.100kbp.tsv", col_types = cols())  %>% 
+  # remove some ANSI carriage movement character
+  mutate(chr = str_remove_all(chr, "\\\033\\[K")) %>% 
+  # filter controls and samples with almost no reads
+  filter( ! sample %in% c("A1_2", "B2_13", "neg","PBS", "Undetermined")) %>% 
+  # order the samples as a factor
+  mutate(sample = factor(sample, levels = c(
+    "WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+    "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+    "A1_4", "A1_6", "A1_7", "A1_8", 
+    "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+    "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+    "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+    "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20"
+  ))) %>% 
+  # remove ch09 with the anomaly and organelle genomes
+  filter(!(chr %in% c("SL4.0ch09", "Mt", "Pt")))
+```
+
+```{r read-sample-table}
+sample_table <- read_csv("../data/tet3-bs-screen-sample-table.csv", col_types = cols()) %>% 
+  mutate(sample = fct_inorder(sample),
+         line = fct_inorder(line),
+         condition = fct_inorder(condition),
+         description = fct_inorder(description))
+```
+
+```{r aesthetic-variables}
+# Aesthetics to plot the PCA and other plots
+subline_colors <- c(A   = RColorBrewer::brewer.pal(8, "Reds")[4], 
+                    A1  = RColorBrewer::brewer.pal(8, "Reds")[6],
+                    A11 = RColorBrewer::brewer.pal(8, "Reds")[8], 
+                    B   = RColorBrewer::brewer.pal(8, "Blues")[4], 
+                    B1  = RColorBrewer::brewer.pal(8, "Blues")[6], 
+                    B2  = RColorBrewer::brewer.pal(8, "Blues")[8], 
+                    WT  = RColorBrewer::brewer.pal(8, "Greys")[8])
+
+line_shapes <- c(WT = 21, A = 23, B = 24)
+genotype_shapes <- c("TET3" = 24, "NT" = 21) 
+```
+
+I filter out the samples that contain less than 14 Million Cytosines covered (WT_6, A_1, A_12, B_6, B_11, B_5, B1_2, B2_14, B2_18 & B2_20) as outliers as explained in the bins PCA report. 
+
+```{r}
+bins_long_table_filtered <- bins_long_table %>%
+  left_join(sample_table, by = "sample") %>% 
+  filter(cytosines > 14e6) # c("B2_18", "B2_20", "B_6", "B_11", "WT_6", "B_5", "A_1", "A_12", "B1_2", "B2_14"))
+```
+
+For each bean I computed the average across the 4 WT plants and obtain the difference to that from each sample. 
+
+```{r}
+pivot_longer_diff_to_reference <- function(bins_wide, reference = WT_mean, values = mR) {
+  bins_wide %>%
+    rename(ref = {{ reference }}) %>%
+    pivot_longer(-c(chr:context,ref), names_to = "sample", values_to = as.character(ensym(values)),
+                 names_transform = list(sample = forcats::fct_inorder)) %>%
+    mutate(diff = {{ values }} - ref)
+}
+```
+
+```{r}
+bins_long_table_filtered_diff <- bins_long_table %>% 
+  pivot_wider(chr:context, names_from = sample, values_from = mR, names_sort = TRUE) %>% 
+  # remove samples with less than 14 M Cs covered
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14)) %>%
+  mutate(WT_mean = (WT_1 + WT_2 + WT_3 + WT_4) / 4) %>%
+  pivot_longer_diff_to_reference() %>% 
+  left_join(sample_table, by = "sample")
+```
+
+## Coverage check {.tabset .tabset-pills}
+
+Some quality check for the coverage levels of this 100 kbp bins
+
+### .
+
+### raincloud plot 
+
+```{r fig.width=13, fig.height=13}
+bins_long_table_filtered %>% 
+  mutate(coverage = reads_m + reads_n) %>% 
+  ggplot(aes(y = coverage, x = sample, fill = condition)) + 
+  facet_grid(cols = vars(description), rows = vars(context), scales = "free", space = "free_x") +
+  ggdist::stat_halfeye(adjust = .5, width = .6, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .15, outlier.shape = NA, color = 1) +
+  gghalves::geom_half_point(side = "l", shape = 16, size = 0.5, alpha = 0.3, range_scale = .4) +
+  scale_fill_manual(values = subline_colors) + 
+  scale_y_continuous(trans = "pseudo_log", breaks = c(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000),
+                     labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Cytosine coverage for 100 kbp bins", 
+       subtitle = "There is a lot of bins with less than 10 Cs, maybe I should filter them out") +
+  theme(axis.line=element_blank(), strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour="black", size=1, fill=NA), legend.position = "none",
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+```
+
+### scatter plot coverage vs %mC
+
+```{r fig.width=10, fig.height=6}
+bins_long_table_filtered %>% 
+  mutate(coverage = reads_m + reads_n) %>% 
+  filter(sample == "WT_1") %>% 
+  ggplot(aes(coverage, mR)) +
+  facet_wrap(vars(context), scales = "free") +
+  geom_point(shape = 16, size = 0.3, alpha = 0.5) +
+  scale_x_continuous(trans = "pseudo_log", breaks = c(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000),
+                     labels = label_number(scale_cut = cut_short_scale())) +
+  theme(axis.line=element_blank(), strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour="black", size=1, fill=NA), legend.position = "none",
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+
+  
+```
+
+
+# Boxplots % mC 
+
+## Comparing all plants in a line {.tabset .tabset-pills}
+
+### %mC
+
+```{r fig.width=5, fig.height=7}
+bins_long_table_filtered %>% 
+  group_by(line, condition, description, sample, context, genotype) %>% 
+  summarise(mR_avg = mean(mR), .groups = "drop") %>% 
+  ggplot(aes(description, mR_avg, fill = condition)) +
+  facet_grid(cols = vars(line), rows = vars(context), scales = "free", space = "free_x") +
+  geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+  geom_quasirandom(aes(shape = genotype), size = 3, dodge.width = 0.75) +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual(values = subline_colors) + 
+  guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+  ylab("% mC") +
+  theme(legend.position = "bottom", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank()) + 
+  labs(title = "Methylation levels of TET3 plants",
+       subtitle = "using average for each plant", 
+       caption = "each dot represents average methylation rate for the whole genome")
+
+ggsave2("../figures/mC_bins/boxplot-100kb-summarised.pdf", width = 5, height = 7)
+```
+
+### %mC diff {.active}
+
+```{r fig.width=5, fig.height=7}
+bins_long_table_filtered_diff %>% 
+  group_by(line, condition, description, sample, context, genotype) %>% 
+  summarise(diff_avg = mean(diff, na.rm = TRUE), .groups = "drop") %>% 
+  ggplot(aes(description, diff_avg, fill = condition)) +
+  facet_grid(cols = vars(line), rows = vars(context), scales = "free", space = "free_x") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+  geom_quasirandom(aes(shape = genotype), size = 3, dodge.width = 0.75) +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual(values = subline_colors) + 
+  guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+  ylab("% mC difference to WT average") +
+  theme(legend.position = "bottom", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank()) + 
+  labs(title = "Methylation change in TET3 plants",
+       subtitle = "using average for each plant", 
+       caption = "each dot represents average methylation rate for the whole genome")
+
+ggsave2("../figures/mC_bins/boxplot-100kb-summarised-diff.pdf", width = 5, height = 7)
+```
+
+## By sample separately {.tabset .tabset-pills}
+
+And now split by context but each boxplot representing the whole set of 100 kb bins
+
+```{r}
+boxplot_mC <- function(ctx, ylim = c(NA, NA)) {
+  ggplot(bins_long_table_filtered %>% filter(context == ctx), aes(sample, mR, fill = condition)) +
+    facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+    stat_summary(geom = "col", fun = mean, alpha = 0.8, width = 0.5, color = "black") +
+    #geom_violin(alpha = 0.5) + 
+    geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+    stat_summary(aes(shape = genotype), geom = "point", fun = mean, color = "black", size = 3) +
+    scale_shape_manual(values = genotype_shapes) +
+    scale_fill_manual(values = subline_colors) + 
+    guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+    ylab("% mC") +
+    #ylim(0, 24) +
+    coord_cartesian(ylim = ylim) +
+    theme(legend.position = "bottom", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+}
+```
+
+```{r}
+boxplot_mC_diff <- function(ctx, ylim = c(NA, NA)) {
+  ggplot(bins_long_table_filtered_diff %>% filter(context == ctx), aes(sample, diff, fill = condition)) +
+    facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    stat_summary(geom = "col", fun = mean, alpha = 0.8, width = 0.5, color = "black") +
+    #geom_violin(scale = "count", alpha = 0.5, color = NA) + 
+    geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+    stat_summary(aes(shape = genotype), geom = "point", fun = mean, color = "black", size = 3) +
+    scale_shape_manual(values = genotype_shapes) +
+    scale_fill_manual(values = subline_colors) + 
+    guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+    ylab("% mC difference to WT average") +
+    #ylim(0, 24) +
+    coord_cartesian(ylim = ylim) +
+    theme(legend.position = "bottom", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+}
+```
+
+```{r}
+boxplot_mC_plot <- (boxplot_mC("CG", ylim = c(75, 95)) + ggtitle("% mCG")) /
+  (boxplot_mC("CHG", ylim = c(35, 80)) + ggtitle("% mCHG")) /
+  (boxplot_mC("CHH", ylim = c(5, 15)) + ggtitle("% mCHH")) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Methylation levels of TET3 plants",
+                  subtitle = "using averages over 100 kbp bins", 
+                  caption = "Dots and columns represent average of methylation rate") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/mC_bins/boxplot-100kb.pdf", 
+        plot = boxplot_mC_plot, width = 8.25, height = 11.75)
+```
+
+```{r}
+boxplot_mC_diff_plot <- (boxplot_mC_diff("CG", ylim = c(-7, 2)) + ggtitle("% mCG")) /
+  (boxplot_mC_diff("CHG", ylim = c(-7, 3)) + ggtitle("% mCHG")) /
+  (boxplot_mC_diff("CHH", ylim = c(-2, 3)) + ggtitle("% mCHH")) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Methylation change in TET3 plants",
+                  subtitle = "using averages over 100 kbp bins", 
+                  caption = "Dots and columns represent average of methylation rate") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/mC_bins/boxplot-100kb-diffs.pdf", 
+        plot = boxplot_mC_diff_plot, width = 8.25, height = 11.75)
+```
+
+### CG {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC("CG", ylim = c(75, 95)) + ggtitle("% mCG") +
+  labs(title = "CG methylation levels of TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC_diff("CG", ylim = c(-7, 2)) + ggtitle("% mCG") +
+  labs(title = "CG methylation changes in TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+### CHG {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC("CHG", ylim = c(35, 80)) +
+  labs(title = "CHG methylation levels of TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC_diff("CHG", ylim = c(-7, 3)) + ggtitle("% mCHG") +
+  labs(title = "CHG methylation changes in TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+### CHH {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC("CHH", ylim = c(5, 15)) + 
+  labs(title = "CHH methylation levels of TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+boxplot_mC_diff("CHH", ylim = c(-2, 3)) + ggtitle("% mCHH") +
+  labs(title = "CHH methylation changes in TET3 plants",
+       subtitle = "using averages over 100 kbp bins", 
+       caption = "Dots and columns represent average of methylation rate")
+```
+
+# Split by chromatin state 
+
+Using information about location of boundaries between euchromatin and heterochromatin inferred from H3K27mac ChIP-seq data, we can compare the changes in DNA methylation between the two compartments of the genome.
+
+## Comparing all plants in a line {.tabset .tabset-pills}
+
+### %mC
+
+```{r fig.width=6, fig.height=11}
+hchrom_H3K27ac_100kbp_bins <- read_tsv("/path/to/genome/SL4.0_heterochromatin_100kbp_bins_H3K27ac_chXX.tsv", show_col_types = FALSE) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames),
+         start = start - 1) %>% 
+  dplyr::rename(chr = seqnames)
+
+bins_long_table_filtered %>% 
+  left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+  filter(!is.na(chromatin)) %>% 
+  group_by(line, condition, description, sample, context, genotype, chromatin) %>% 
+  summarise(mR_avg = mean(mR), .groups = "drop") %>% 
+  ggplot(aes(description, mR_avg, fill = condition)) +
+  facet_grid(cols = vars(line), rows = vars(context, chromatin), scales = "free", space = "free_x") +
+  geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+  geom_quasirandom(aes(shape = genotype), size = 3, dodge.width = 0.75) +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual(values = subline_colors) + 
+  guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+  ylab("% mC") +
+  theme(legend.position = "bottom", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank()) + 
+  labs(title = "Methylation levels of TET3 plants",
+       subtitle = "using average for each plant, split by Eu/Heterochromatin", 
+       caption = "each dot represents average methylation rate for the whole genome")
+
+ggsave2("../figures/mC_bins/boxplot-100kb-chromatin-summarised.pdf", width = 6, height = 11)
+```
+
+### %mC diff
+
+```{r fig.width=6, fig.height=11}
+bins_long_table_filtered_diff %>% 
+  left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+  filter(!is.na(chromatin)) %>% 
+  group_by(line, condition, description, sample, context, genotype, chromatin) %>% 
+  summarise(diff_avg = mean(diff, na.rm = TRUE), .groups = "drop") %>% 
+  ggplot(aes(description, diff_avg, fill = condition)) +
+  facet_grid(cols = vars(line), rows = vars(context, chromatin), scales = "free", space = "free_x") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+  geom_quasirandom(aes(shape = genotype), size = 3, dodge.width = 0.75) +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual(values = subline_colors) + 
+  guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+  ylab("% mC difference to WT average") +
+  theme(legend.position = "bottom", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank()) + 
+  labs(title = "Methylation change in TET3 plants",
+       subtitle = "using average for each plant, split by Eu/Heterochromatin", 
+       caption = "each dot represents average methylation rate for the whole genome")
+```
+
+## By sample separately {.tabset .tabset-pills}
+
+And now split by context but each boxplot representing the whole set of 100 kb bins
+
+```{r}
+boxplot_mC_chromatin <- function(ctx, chrmt, ylim = c(NA, NA)) {
+  bins_long_table_filtered %>% 
+    left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+    filter(chromatin == chrmt,
+           context == ctx,) %>% 
+    ggplot(aes(sample, mR, fill = condition)) +
+    facet_grid(cols = vars(description),scales = "free_x", space = "free_x") +
+    stat_summary(geom = "col", fun = mean, alpha = 0.8, width = 0.5, color = "black") +
+    #geom_violin(alpha = 0.3) + 
+    geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+    stat_summary(aes(shape = genotype), geom = "point", fun = mean, color = "black", size = 3) +
+    scale_shape_manual(values = genotype_shapes) +
+    scale_fill_manual(values = subline_colors) + 
+    guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+    ylab("% mC") +
+    coord_cartesian(ylim = ylim) +
+    theme(legend.position = "bottom", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+}
+```
+
+```{r}
+boxplot_mC_diff_chromatin <- function(ctx, chrmt, ylim = c(NA, NA)) {
+  bins_long_table_filtered_diff %>% 
+    left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+    filter(chromatin == chrmt,
+           context == ctx,) %>% 
+    ggplot(aes(sample, diff, fill = condition)) +
+    facet_grid(cols = vars(description), scales = "free_x", space = "free_x") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    stat_summary(geom = "col", fun = mean, alpha = 0.8, width = 0.5, color = "black") +
+    #geom_violin(scale = "count", alpha = 0.5, color = NA) + 
+    geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+    stat_summary(aes(shape = genotype), geom = "point", fun = mean, color = "black", size = 3) +
+    scale_shape_manual(values = genotype_shapes) +
+    scale_fill_manual(values = subline_colors) + 
+    guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+    ylab("% mC difference to WT average") +
+    #ylim(0, 24) +
+    coord_cartesian(ylim = ylim) +
+    theme(legend.position = "bottom", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+}
+```
+
+### CG {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_chromatin("CG", "Euchromatin", ylim = c(50, 80)) +
+  labs(title = "CG methylation levels of TET3 plants",
+       subtitle = "Euchromatin ")) /
+(boxplot_mC_chromatin("CG", "Heterochromatin", ylim = c(84, 94)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/mC_bins/boxplot-100kb-chromatin-CG.pdf", width = 8, height = 6)
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_diff_chromatin("CG", "Euchromatin", ylim = c(-8, 5)) +
+  labs(title = "CG methylation changes in TET3 plants",
+       subtitle = "Euchromatin ")) /
+(boxplot_mC_diff_chromatin("CG", "Heterochromatin", ylim = c(-7, 2)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+```
+
+### CHG {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_chromatin("CHG", "Euchromatin", ylim = c(4, 25)) +
+   labs(title = "CHG methylation levels of TET3 plants",
+       subtitle = "Euchromatin")) /
+(boxplot_mC_chromatin("CHG", "Heterochromatin", ylim = c(63, 78)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/mC_bins/boxplot-100kb-chromatin-CHG.pdf", width = 8, height = 6)
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_diff_chromatin("CHG", "Euchromatin", ylim = c(-4, 4)) +
+  labs(title = "CHG methylation changes in TET3 plants",
+       subtitle = "Euchromatin ")) /
+(boxplot_mC_diff_chromatin("CHG", "Heterochromatin", ylim = c(-8, 3)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+```
+
+### CHH {.tabset}
+
+#### %mC 
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_chromatin("CHH", "Euchromatin", ylim = c(1.5, 7)) +
+  labs(title = "CHH methylation levels of TET3 plants",
+       subtitle = "Euchromatin")) /
+(boxplot_mC_chromatin("CHH", "Heterochromatin", ylim = c(6, 12)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/mC_bins/boxplot-100kb-chromatin-CHH.pdf", width = 8, height = 6)
+```
+
+#### %mC difference
+
+```{r fig.width=9, fig.height=7}
+(boxplot_mC_diff_chromatin("CHH", "Euchromatin", ylim = c(-2, 2)) +
+  labs(title = "CHH methylation changes in TET3 plants",
+       subtitle = "Euchromatin ")) /
+(boxplot_mC_diff_chromatin("CHH", "Heterochromatin", ylim = c(-2.5, 3.5)) +
+  labs(subtitle = " Heterochromatin", 
+       caption = "Dots and columns represent average of methylation rate")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom')
+```
+
+# Other plots of whole genome methylation {.tabset}
+
+## per Chromosome
+
+```{r fig.height=5, fig.width=8}
+bins_long_table_filtered %>% 
+  filter(!chr %in% c("Mt", "Pt", "SL4.0ch00")) %>% 
+  group_by(sample, condition, description, line, chr, context) %>% 
+  filter(context == "CG") %>% 
+  summarise(chr_mR = mean(mR), .groups = "drop") %>% 
+  ggplot(aes(sample, chr_mR, fill = condition)) +
+  facet_grid(cols = vars(description),scales = "free_x", space = "free_x") +
+  stat_summary(geom = "col", fun = mean, alpha = 0.6, width = 0.5) +
+  geom_boxplot(outlier.shape = NA, color = 1, alpha = 0.2, width = 0.9) +
+  geom_quasirandom(shape = 21, size = 2, dodge.width = 0.75) +
+  coord_cartesian(ylim = c(73, NA)) +
+  scale_fill_manual(values = subline_colors) + 
+  labs(title = "Methylation levels of TET3 plants", y = "% mCG",
+       subtitle = "using average for chromosome, only CG context", 
+       caption = "each dot represents average methylation rate for each chromosome") +
+  theme(legend.position = "none", 
+          strip.background = element_rect(colour = NA, fill = "lightpink"),
+          panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+          axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+```
+
+## just average
+
+Average for the whole genome all Cytosines (all contexts mixed)
+
+```{r fig.height=5, fig.width=8 }
+ggplot(bins_long_table_filtered, aes(sample, mR, fill = condition)) +
+  facet_grid(cols = vars(description),scales = "free_x", space = "free_x") +
+  stat_summary(geom = "col", fun = mean, color = "black", width = 0.8, alpha = 0.5) +
+  coord_cartesian(ylim = c(46, 51)) +
+  scale_fill_manual(values = subline_colors) +
+  labs(title = "Methylation levels of TET3 plants", y = "% mC",
+       subtitle = "using average the whole genome and all contexts mixed") +
+  theme(legend.position = "none", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+```
+
+## from bismark reports
+
+```{r}
+bismark_report <- read_tsv("../qa/3_mapped/bismark_summary_report.txt", col_types = cols()) %>% 
+  transmute(sample = str_remove(File, "_bismark_bt2.bam") %>% 
+              factor(levels = c("WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+                                            "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+                                            "A1_4", "A1_6", "A1_7", "A1_8", 
+                                            "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+                                            "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+                                            "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+                                            "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20")), 
+         mCG  = 100 * `Methylated CpGs` / (`Methylated CpGs`+ `Unmethylated CpGs`),
+         mCHG = 100 * `Methylated chgs` / (`Methylated chgs` + `Unmethylated chgs`),
+         mCHH = 100 * `Methylated CHHs` / (`Methylated CHHs` + `Unmethylated CHHs`),
+         ) %>% 
+  inner_join(sample_table, by = "sample") %>% 
+  filter(cytosines > 14e6)
+```
+
+```{r fig.height=5, fig.width=8}
+ggplot(bismark_report, aes(sample, mCG, fill = condition)) +
+  facet_grid(cols = vars(description),scales = "free_x", space = "free_x") +
+  geom_col(color = "black", width = 0.8, alpha = 0.5) +
+  coord_cartesian(ylim = c(82, 88)) +
+  #coord_cartesian(ylim = c(50, NA)) +
+  scale_fill_manual(values = subline_colors) +
+  labs(title = "Methylation levels of TET3 plants", y = "% mCG",
+       subtitle = "from Bismark methylation reports") +
+  theme(legend.position = "none", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+```
+
+## from old analysis {.tabset}
+
+```{r}
+#readxl::excel_sheets("analysis_2018/SC-BSseq.xlsx")
+old_analysis <- readxl::read_excel("../analysis_2018/SC-BSseq.xlsx", sheet = "Plot") %>% 
+  transmute(sample = Plant %>% 
+              factor(levels = c("WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+                                "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+                                "A1_4", "A1_6", "A1_7", "A1_8", 
+                                "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+                                "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+                                "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+                                "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20")), 
+         mCG  = 100 * `% mCG`,
+         mCHG = 100 * `% mCHG`,
+         mCHH = 100 * `% mCHH`
+         ) %>% 
+  inner_join(sample_table, by = "sample")
+```
+
+### new plot
+
+```{r fig.height=5, fig.width=8}
+old_analysis %>% 
+  filter(cytosines > 14e6) %>% 
+  ggplot(aes(sample, mCG, fill = condition)) +
+  facet_grid(cols = vars(description),scales = "free_x", space = "free_x") +
+  geom_col(color = "black", width = 0.8, alpha = 0.5) +
+  coord_cartesian(ylim = c(60, NA)) +
+  #coord_cartesian(ylim = c(50, NA)) +
+  scale_fill_manual(values = subline_colors) +
+  labs(title = "Methylation levels of TET3 plants", y = "% mCG",
+       subtitle = "from old analysis in 2018") +
+  theme(legend.position = "none", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank())
+```
+
+```{r fig.width=6, fig.height=5}
+ggplot(old_analysis, aes(description, mCG, fill = condition)) +
+  facet_grid(cols = vars(line), scales = "free", space = "free_x") +
+  geom_boxplot(outlier.colour = NA, color = "black", alpha = 0.3, width = 0.9) +
+  geom_quasirandom(aes(shape = genotype), size = 3, dodge.width = 0.75) +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual(values = subline_colors) + 
+  guides(fill = "none", shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 5))) +
+  ylab("% mCG") +
+  theme(legend.position = "bottom", 
+        strip.background = element_rect(colour = NA, fill = "lightpink"),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5), axis.title.x = element_blank()) + 
+  labs(title = "Methylation levels of TET3 plants",
+       subtitle = "using average for each plant, data form old analysis in 2018", 
+       caption = "each dot represents average methylation rate for the whole genome")
+```
+
+
+### simple plot
+
+```{r fig.height=6, fig.width=12}
+ggplot(old_analysis, aes(sample, mCG, fill = condition)) +
+  geom_col(alpha = 0.5, width = 0.7) +
+  coord_cartesian(ylim = c(60, NA)) +
+  scale_fill_manual(values = subline_colors) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+
+ggsave("../analysis_2018/colplot_mCG.pdf", width = 12, height = 4)
+```
+

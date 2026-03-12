@@ -1,0 +1,264 @@
+---
+title: "Tomato chromatin segmentation"
+subtitle: "_Defining heterochromatin segments based on gene densiry and H3K27ac_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r include=FALSE}
+# Libraries
+library(plyranges)
+library(tidyverse)
+library(slider)
+library(cowplot); theme_set(theme_cowplot())
+library(patchwork)
+
+facet_chr <- function(chr = chr, rows = NULL, scales = "free_x", space = "free_x", breaks = 40e6) {
+  list(facet_grid(rows = vars({{ rows }}), cols = vars({{ chr }}), scales = scales, space = space),
+       scale_x_continuous(expand = c(0, 0), limits = c(0, NA), breaks = scales::breaks_width(breaks), labels = scales::label_number_si()),
+       xlab("Position across the genome (Mbp)"))
+}
+```
+
+# Heterochromatin segmentation
+
+## Based in H3K27ac
+
+```{r}
+k27ac <- read_bigwig("../../tracks/v4/marks/wt_K27ac.bw")
+
+bins_100kb <- tileGenome(seqlengths = seqinfo(k27ac), tilewidth = 1e5, cut.last.tile.in.chrom = TRUE)
+
+k27ac_100kb <- binnedAverage(bins_100kb, mcolAsRleList(k27ac, "score"), "binned_var")
+```
+
+I defined Euchromatin as those 100 kbp bins for which the 2 Mbp average (centred in that bin) of H3k27ac ChIP-seq is higher than 11
+
+```{r fig.width=10, fig.height=4}
+k27ac_threshold = 11
+flanking = 10
+scale_h3k27ac <- scale_fill_viridis_c("H3K27ac", option = "magma", limits = c(0, 20), oob=scales::squish)
+  
+k27ac_100kb_tb <- k27ac_100kb %>%
+  as_tibble() %>%
+  mutate(seqnames = str_remove(seqnames, "SL4.0"),
+         binned_var = replace_na(binned_var, 0)) %>% 
+  group_by(seqnames) %>%
+  arrange(seqnames, start) %>%
+  mutate(mean   = slide_dbl(binned_var, ~mean(.x), .before = flanking, .after = flanking),
+         median = slide_dbl(binned_var, ~median(.x), .before = flanking, .after = flanking),
+         chromatin = case_when(mean > k27ac_threshold ~ "Euchromatin",
+                               mean <= k27ac_threshold ~ "Heterochromatin"))
+
+
+k27ac_histogram <- ggplot(k27ac_100kb_tb, aes(y = binned_var, fill=..y..)) +
+  geom_histogram(binwidth = 0.5, color = 1, size = 0.3) +
+  geom_hline(yintercept = k27ac_threshold, linetype = "dashed", color = "red3") +
+  coord_cartesian(ylim = c(NA, 30)) +
+  scale_y_continuous(position = "right", expand = c(0, 0.5)) +
+  scale_x_reverse(expand = expansion(c(.05, 0))) +
+  scale_h3k27ac +
+  labs(y = "H3K27ac",
+       x = "Number of bins") +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0.05, vjust = 0.5))
+
+k27ac_points <- ggplot(k27ac_100kb_tb, aes(start, binned_var)) +
+  facet_chr(chr = seqnames) +
+  geom_jitter(shape = 16, size = 0.4, alpha = 0.7, height = 0.5, width = 0) +
+  geom_line(aes(y = mean), color = "cornflowerblue",) +
+  geom_hline(yintercept = k27ac_threshold, linetype = "dashed", color = "red3") +
+  coord_cartesian(expand = FALSE, ylim = c(NA, 22)) +
+  theme(strip.background = element_rect(colour = NA, fill = "blanchedalmond"), axis.ticks.x = element_blank(),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), axis.text.x = element_blank(), plot.margin = margin(b = 0))
+
+k27ac_tile_continous <- ggplot(k27ac_100kb_tb, aes(start, y = "", fill = mean)) +
+  facet_chr(chr = seqnames) +
+  geom_raster() +
+  scale_y_discrete(expand = c(0, 0)) +
+  scale_h3k27ac +
+  theme(panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.ticks = element_blank(), axis.title = element_blank(), axis.text = element_blank(),
+        strip.text = element_blank(), plot.margin = margin(t = 0, b = 0))
+
+k27ac_tile_discrete <- ggplot(k27ac_100kb_tb, aes(start, y = "", fill = chromatin)) +
+  facet_chr(chr = seqnames) +
+  geom_raster() +
+  scale_y_discrete(expand = c(0, 0)) +
+  scale_fill_manual(values = c("royalblue1", "grey80")) +
+  theme(legend.position = "bottom", strip.text = element_blank(), axis.ticks.y = element_blank(), 
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0.05, vjust = 0.5), plot.margin = margin(t = 0))
+
+k27ac_histogram +
+  (k27ac_points /
+     k27ac_tile_continous /
+     k27ac_tile_discrete + 
+     plot_layout(heights = c(5, 1, 1))) +
+  plot_layout(widths = c(1, 8), guides = "collect") +
+  plot_annotation(
+    title = "Chromatin classification based on H3K27ac ChIP-seq",
+    subtitle = "Using a threshold of 11 for H3K27ac over a 2 Mbp moving average") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/chromatin/chromatin-classification-H3K27ac-.pdf", width = 10, height = 4)
+```
+
+## Based on gene density
+
+I defined Euchromatin as those 100 kbp bins for which the 2 Mbp average (centred in that bin) of gene density is higher than 8 genes per 100 kbp
+
+```{r fig.width=10, fig.height=4}
+genes <- read_bed("/path/to/genome/ITAG4.1/ITAG4.1_gene_positions.bed")
+
+n_genes_threshold = 8
+flanking = 10
+scale_genes <- scale_fill_viridis_c("Genes per 100 kb", option = "viridis", limits = c(0, 15), oob=scales::squish)
+
+binned_genes <- genes %>%
+  as_tibble() %>%
+  group_by(seqnames, bins = cut_width(start, width = 1e5, boundary = 0)) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  separate(bins, into = c(NA, "start", "end", NA), sep = "[\\[\\(,\\]\\)]", convert = TRUE) %>% 
+  mutate(start = start + 1) %>% 
+  right_join(bins_100kb %>% as_tibble(), by = c("seqnames", "start", "end")) %>% 
+  mutate(seqnames = str_remove(seqnames, "SL4.0"),
+         n_genes = replace_na(n_genes, 0)) %>% 
+  group_by(seqnames) %>%
+  arrange(seqnames, start) %>%
+  mutate(mean   = slide_dbl(n_genes, ~mean(.x), .before = flanking, .after = flanking),
+         median = slide_dbl(n_genes, ~median(.x), .before = flanking, .after = flanking),
+         chromatin = case_when(mean > n_genes_threshold ~ "Euchromatin",
+                               mean <= n_genes_threshold ~ "Heterochromatin"))
+
+
+gene_histogram <- ggplot(binned_genes, aes(y = n_genes, fill=..y..)) +
+  geom_histogram(binwidth = 1, color = 1) +
+  geom_hline(yintercept = n_genes_threshold, linetype = "dashed", color = "red3") +
+  coord_cartesian(ylim = c(NA, 22)) +
+  scale_y_continuous(position = "right", expand = c(0, 0.5)) +
+  scale_x_reverse(expand = expansion(c(.05, 0))) +
+  scale_genes +
+  labs(y = "Genes / 100 kb",
+       x = "Number of bins") +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0.05, vjust = 0.5))
+
+gene_points <- ggplot(binned_genes, aes(start, n_genes)) +
+  facet_chr(chr = seqnames) +
+  geom_jitter(shape = 16, size = 0.4, alpha = 0.7, height = 0.5, width = 0) +
+  geom_line(aes(y = mean), color = "cornflowerblue",) +
+  geom_hline(yintercept = n_genes_threshold, linetype = "dashed", color = "red3") +
+  coord_cartesian(expand = FALSE, ylim = c(NA, 22)) +
+  theme(strip.background = element_rect(colour = NA, fill = "blanchedalmond"), axis.ticks.x = element_blank(),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), axis.text.x = element_blank(), plot.margin = margin(b = 0))
+ 
+gene_tile_continous <- ggplot(binned_genes, aes(start, y = "", fill = mean)) +
+  facet_chr(chr = seqnames) +
+  geom_raster() +
+  scale_y_discrete(expand = c(0, 0)) +
+  scale_genes +
+  theme(panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.ticks = element_blank(), axis.title = element_blank(), axis.text = element_blank(),
+        strip.text = element_blank(), plot.margin = margin(t = 0, b = 0))
+
+gene_tile_discrete <- ggplot(binned_genes, aes(start, y = "", fill = chromatin)) +
+  facet_chr(chr = seqnames) +
+  geom_raster() +
+  scale_y_discrete(expand = c(0, 0)) +
+  scale_fill_manual(values = c("royalblue1", "grey80")) +
+  theme(legend.position = "bottom", strip.text = element_blank(), axis.ticks.y = element_blank(), 
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(angle = -90, hjust = 0.05, vjust = 0.5), plot.margin = margin(t = 0))
+
+gene_histogram +
+  (gene_points /
+     gene_tile_continous /
+     gene_tile_discrete + 
+     plot_layout(heights = c(5, 1, 1))) +
+  plot_layout(widths = c(1, 8), guides = "collect") +
+  plot_annotation(
+    title = "Chromatin classification based on gene density",
+    subtitle = "Using a threshold of 8 genes per 100 kbp windows (over a 2 Mbp moving average)") &
+  theme(legend.position='bottom')
+
+ggsave2("../figures/chromatin/chromatin-classification-genes-.pdf", width = 10, height = 4)
+```
+
+## Save Heterochomatin coordinates
+
+I've saved both the 100 kbp bin to be able to classify bins of that size directly and a simplified version of reduced ranges, fir which I've filtered out Heterochromatin chunks smaller than 500 kbp.
+
+```{r}
+# H3K27ac
+hchrom_k27ac <- k27ac_100kb_tb %>% 
+  filter(chromatin == "Heterochromatin") %>% 
+  select(seqnames:strand) %>% 
+  as_granges() %>% 
+  plyranges::reduce_ranges() %>% 
+  filter(width > 5e5)
+
+write_bed(hchrom_k27ac, "/path/to/genome/SL4.0_heterochromatin_H3K27ac_chXX.bed")
+
+k27ac_100kb_tb %>% 
+  select(seqnames:end, chromatin) %>% 
+  write_tsv("/path/to/genome/SL4.0_heterochromatin_100kbp_bins_H3K27ac_chXX.tsv")
+ 
+# Gene density
+hchrom_genes <- binned_genes %>% 
+  filter(chromatin == "Heterochromatin") %>% 
+  select(seqnames:strand) %>% 
+  as_granges() %>% 
+  plyranges::reduce_ranges() %>% 
+  filter(width > 5e5)
+
+write_bed(hchrom_genes, "/path/to/genome/SL4.0_heterochromatin_gene_density_chXX.bed")
+
+binned_genes %>% 
+  select(seqnames:end, chromatin) %>% 
+  write_tsv("/path/to/genome/SL4.0_heterochromatin_100kbp_bins_gene_density_chXX.tsv")
+```
+
+Example of how to plot the heterochomatin in a chromosome plot with ggplot and geom_heterochromatin
+
+```{r heterochromatin function}
+heterochromatin_H3K27ac = read_tsv("/path/to/genome/SL4.0_heterochromatin_H3K27ac_chXX.bed", col_names = c("seqnames","start","end"), col_types = cols())
+
+geom_heterochromatin <- function(hchrom = heterochromatin_H3K27ac, chr_col = seqnames) {
+  hchrom <- rename(hchrom, {{ chr_col }} := seqnames)
+  list(geom_rect(data = hchrom, aes(x = NULL, y = NULL, xmin = start, xmax = end, ymin = -Inf, ymax = Inf), 
+                 color = NA, fill = "black", alpha = 0.1))
+}
+```
+
+```{r fig.width=10, fig.height=2}
+ggplot(k27ac_100kb_tb, aes(start, binned_var)) +
+  facet_chr(chr = seqnames) + 
+  geom_heterochromatin() +
+  geom_jitter(shape = 16, size = 0.4, alpha = 0.7, height = 0.5, width = 0) +
+  geom_line(aes(y = mean), color = "cornflowerblue",) +
+  geom_hline(yintercept = k27ac_threshold, linetype = "dashed", color = "red3") +
+  coord_cartesian(expand = FALSE, ylim = c(NA, 22)) +
+  theme(strip.background = element_rect(colour = NA, fill = "blanchedalmond"), axis.ticks.x = element_blank(),
+        panel.border = element_rect(colour = "black", size = 1), axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), axis.text.x = element_blank(), plot.margin = margin(b = 0))
+```
+

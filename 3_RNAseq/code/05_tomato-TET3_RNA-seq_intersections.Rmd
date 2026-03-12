@@ -1,0 +1,237 @@
+---
+title: "DEGs intersections and connection to DMRs"
+subtitle: "_Tomato TET3 RNA-seq_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+```{r libraries-and-functions, include=FALSE}
+library(tidyverse)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+library(scales)
+library(GeneOverlap)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(shadowtext)
+
+brewer.ramp <- function(start, end, pal) {
+  palette = RColorBrewer::brewer.pal(n = RColorBrewer::brewer.pal.info[pal, "maxcolors"],  name = pal)
+  sequence = seq(start, end, (end - start)/(RColorBrewer::brewer.pal.info[pal, "maxcolors"] - 1))
+  ramp = circlize::colorRamp2(sequence, palette)
+  return(ramp)
+}
+```
+
+### Intersection
+
+Use gene overlap?
+
+Venn diagram for all A4 vs all A17
+
+Venn diagram for up and down (like elife paper figure 1E)
+
+## overlap between DEGs {.tabset}
+
+Load DEGs
+
+```{r load-DEGs}
+vsd  <- read_tsv("../data/4_counts/counts_vsd.tsv", show_col_types = FALSE)
+#readxl::excel_sheets("../../rnaseq/data/6_degs/DEGs_p01_lfc1_with_counts_1.xlsx")
+degs <- list()
+degs$A17_vs_WT  <- readxl::read_excel("../../rnaseq/data/6_degs/DEGs_p01_lfc1_with_vsd.xlsx", sheet = "A17_vs_WT")
+degs$A4_vs_WT   <- readxl::read_excel("../../rnaseq/data/6_degs/DEGs_p01_lfc1_with_vsd.xlsx", sheet = "A4_vs_WT")
+degs$A17_vs_A4  <- readxl::read_excel("../../rnaseq/data/6_degs/DEGs_p01_lfc1_with_vsd.xlsx", sheet = "A17_vs_A4")
+```
+
+```{r create-lists-of-genes}
+# pull the IDs to a list -----
+ids <- list(
+  A17_vs_WT_DEGs  = degs$A17_vs_WT %>% pull(id),
+  A17_vs_WT_DEGs_up   = degs$A17_vs_WT %>% filter(log2FoldChange > 0) %>% pull(id),
+  A17_vs_WT_DEGs_down = degs$A17_vs_WT %>% filter(log2FoldChange < 0) %>% pull(id),
+  A4_vs_WT_DEGs  = degs$A4_vs_WT %>% pull(id),
+  A4_vs_WT_DEGs_up   = degs$A4_vs_WT %>% filter(log2FoldChange > 0) %>% pull(id),
+  A4_vs_WT_DEGs_down = degs$A4_vs_WT %>% filter(log2FoldChange < 0) %>% pull(id),
+  A17_vs_A4_DEGs  = degs$A17_vs_A4 %>% pull(id),
+  A17_vs_A4_DEGs_up   = degs$A17_vs_A4 %>% filter(log2FoldChange > 0) %>% pull(id),
+  A17_vs_A4_DEGs_down = degs$A17_vs_A4 %>% filter(log2FoldChange < 0) %>% pull(id)
+)
+```
+
+### Single overlap
+
+```{r}
+intersect(ids$A4_vs_WT_DEGs_down, ids$A17_vs_A4_DEGs_up) %>% str_remove("gene:") %>% cat()
+```
+
+
+```{r single-overlap}
+# Test a single overlap -----
+
+newGeneOverlap(ids$A17_vs_WT_DEGs, ids$A4_vs_WT_DEGs, genome.size = nrow(vsd)) %>%
+  testGeneOverlap() %>%
+  print()
+```
+
+### Matrix of overlaps {.active}
+
+```{r fig.height=7, fig.width=5}
+# Matrix of overlaps -----
+matrix_degs <- newGOM(ids[4:6], ids[1:3], genome.size = nrow(vsd))
+
+# make my own heatmap function
+overlap_heatmap <- function(mat, col = brewer.ramp(0, 1, "Reds"), name = "something", mat2 = mat, sprintf = "%.2f") {
+  Heatmap(mat, col = col, name = name, rect_gp = gpar(col = "black", lwd = 2),
+          column_title = name, cluster_columns = FALSE, cluster_rows = FALSE,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            #grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 13))
+            grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 10 , col = "white"), bg.colour = "black")
+          })
+}
+
+# get matrices to plot
+p_values      = getMatrix(matrix_degs, name = "pval")
+odds_ratio    = getMatrix(matrix_degs, name = "odds.ratio")
+intersections = getMatrix(matrix_degs, name = "intersection")
+unions        = getMatrix(matrix_degs, name = "union")
+jaccard_index = getMatrix(matrix_degs, name = "Jaccard") # proportion of union that intersects
+
+# plot heatmaps side by side
+hms <- overlap_heatmap(-log10(p_values), col = brewer.ramp(0, 100, "YlOrRd"),   name = "p value (exp)", sprintf = "%.0f") +
+  overlap_heatmap(odds_ratio,     col = brewer.ramp(0, 25, "YlGnBu"), name = "Odds ratio") +
+  overlap_heatmap(jaccard_index,  col = brewer.ramp(0, 0.15, "YlGn"), name = "Jaccard index") +
+  overlap_heatmap(intersections,  col = brewer.ramp(0, 150, "BuPu"), name = "intersections", sprintf = "%.0f")
+```
+
+```{r, fig.width=9.5, fig.height=4}
+# draw the heatmaps and save them
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+
+pdf(file = "../figures/intersections_DEGs_A17_A4.pdf", width = 9.5, height = 4)
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+invisible(dev.off())
+```
+
+```{r fig.height=7, fig.width=5}
+# Matrix of overlaps -----
+matrix_degs <- newGOM(ids[5:6], ids[2:3], genome.size = nrow(vsd))
+
+# get matrices to plot
+p_values      = getMatrix(matrix_degs, name = "pval")
+odds_ratio    = getMatrix(matrix_degs, name = "odds.ratio")
+intersections = getMatrix(matrix_degs, name = "intersection")
+unions        = getMatrix(matrix_degs, name = "union")
+jaccard_index = getMatrix(matrix_degs, name = "Jaccard") # proportion of union that intersects
+
+# plot heatmaps side by side
+hms <- overlap_heatmap(-log10(p_values), col = brewer.ramp(0, 80, "YlOrRd"),   name = "p value (exp)", sprintf = "%.0f") +
+  overlap_heatmap(odds_ratio,     col = brewer.ramp(0, 25, "YlGnBu"), name = "Odds ratio") +
+  overlap_heatmap(jaccard_index,  col = brewer.ramp(0, 0.10, "YlGn"), name = "Jaccard index") +
+  overlap_heatmap(intersections,  col = brewer.ramp(0, 95, "BuPu"), name = "intersections", sprintf = "%.0f")
+```
+
+```{r, fig.width=8, fig.height=3.5}
+# draw the heatmaps and save them
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+
+pdf(file = "../figures/intersections_DEGs_A17_A4_split.pdf", width = 8, height = 3.5)
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+invisible(dev.off())
+```
+
+```{r fig.height=7, fig.width=5}
+# Matrix of overlaps -----
+matrix_degs <- newGOM(ids[7:9], ids[1:3], genome.size = nrow(vsd))
+
+# make my own heatmap function
+overlap_heatmap <- function(mat, col = brewer.ramp(0, 1, "Reds"), name = "something", mat2 = mat, sprintf = "%.2f") {
+  Heatmap(mat, col = col, name = name, rect_gp = gpar(col = "black", lwd = 2),
+          column_title = name, cluster_columns = FALSE, cluster_rows = FALSE,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            #grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 13))
+            grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 10 , col = "white"), bg.colour = "black")
+          })
+}
+
+# get matrices to plot
+p_values      = getMatrix(matrix_degs, name = "pval")
+odds_ratio    = getMatrix(matrix_degs, name = "odds.ratio")
+intersections = getMatrix(matrix_degs, name = "intersection")
+unions        = getMatrix(matrix_degs, name = "union")
+jaccard_index = getMatrix(matrix_degs, name = "Jaccard") # proportion of union that intersects
+
+# plot heatmaps side by side
+hms <- overlap_heatmap(-log10(p_values), col = brewer.ramp(0, 100, "YlOrRd"),   name = "p value (exp)", sprintf = "%.0f") +
+  overlap_heatmap(odds_ratio,     col = brewer.ramp(0, 25, "YlGnBu"), name = "Odds ratio") +
+  overlap_heatmap(jaccard_index,  col = brewer.ramp(0, 0.15, "YlGn"), name = "Jaccard index") +
+  overlap_heatmap(intersections,  col = brewer.ramp(0, 150, "BuPu"), name = "intersections", sprintf = "%.0f")
+```
+
+```{r, fig.width=9.5, fig.height=4}
+# draw the heatmaps and save them
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+
+pdf(file = "../figures/intersections_DEGs_A17-vs-WT_vs_A17-vs-A4.pdf", width = 9.5, height = 4)
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+invisible(dev.off())
+```
+
+```{r fig.height=7, fig.width=5}
+# Matrix of overlaps -----
+matrix_degs <- newGOM(ids[7:9], ids[4:6], genome.size = nrow(vsd))
+
+# make my own heatmap function
+overlap_heatmap <- function(mat, col = brewer.ramp(0, 1, "Reds"), name = "something", mat2 = mat, sprintf = "%.2f") {
+  Heatmap(mat, col = col, name = name, rect_gp = gpar(col = "black", lwd = 2),
+          column_title = name, cluster_columns = FALSE, cluster_rows = FALSE,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            #grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 13))
+            grid.shadowtext(sprintf(sprintf, mat2[i, j]), x, y, gp = gpar(fontsize = 10 , col = "white"), bg.colour = "black")
+          })
+}
+
+# get matrices to plot
+p_values      = getMatrix(matrix_degs, name = "pval")
+odds_ratio    = getMatrix(matrix_degs, name = "odds.ratio")
+intersections = getMatrix(matrix_degs, name = "intersection")
+unions        = getMatrix(matrix_degs, name = "union")
+jaccard_index = getMatrix(matrix_degs, name = "Jaccard") # proportion of union that intersects
+
+# plot heatmaps side by side
+hms <- overlap_heatmap(-log10(p_values), col = brewer.ramp(0, 100, "YlOrRd"),   name = "p value (exp)", sprintf = "%.0f") +
+  overlap_heatmap(odds_ratio,     col = brewer.ramp(0, 25, "YlGnBu"), name = "Odds ratio") +
+  overlap_heatmap(jaccard_index,  col = brewer.ramp(0, 0.15, "YlGn"), name = "Jaccard index") +
+  overlap_heatmap(intersections,  col = brewer.ramp(0, 150, "BuPu"), name = "intersections", sprintf = "%.0f")
+```
+
+```{r, fig.width=9.5, fig.height=4}
+# draw the heatmaps and save them
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+
+pdf(file = "../figures/intersections_DEGs_A4-vs-WT_vs_A17-vs-A4.pdf", width = 9, height = 3)
+draw(hms,  gap = unit(0.5,"cm"), column_title = gt_render("**Intersections of DEGs between A17 (neg) and A4 (pos)**"))
+invisible(dev.off())
+```
+
+## Exploring the overlap of interest
+
+```{r}
+## GO ANALYSIS ON IT
+```
+
+```{r}
+## CONNEVTION TO DMRS
+```
+
+

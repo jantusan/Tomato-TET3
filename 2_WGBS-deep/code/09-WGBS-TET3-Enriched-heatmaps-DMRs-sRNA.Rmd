@@ -1,0 +1,240 @@
+---
+title: "Enriched Heatmaps for Tomato TET3: DMRs and sRNAs"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    toc_float: yes
+    theme: paper
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r libraries, include=FALSE}
+source("/path/to/project/bin/R/enriched_heatmaps_functions.R")
+library(plyranges)
+library(tidyverse)
+ht_opt$message = FALSE
+```
+
+# Load data
+
+```{r}
+dmrs_list_gr <- read_rds("../data/6_dmrs-2025/DMR-list_TET3_NTS_CHG-combined_GRanges.rds")
+
+genes <- read_bed("/path/to/genome/ITAG4.1/ITAG4.1_gene_positions.no-ch09.bed")
+
+marks <- list(
+  sRNA_21 = read_bigwig("../../sRNAseq-Sara-Lopez/data/5_tracks/1mm.m50/LEAF1.1mm.m50.SL4.0.21.bw"),
+  sRNA_24 = read_bigwig("../../sRNAseq-Sara-Lopez/data/5_tracks/1mm.m50/LEAF1.1mm.m50.SL4.0.24.bw")
+)
+```
+
+# Enriched heatmaps
+
+```{r normalise-marks-function}
+# normalise several marks with several samples to matrices 
+normalise_marks <- function(target, extend = 2000, samples = c("wt", "a17", "a4"), reference = samples[1],
+                            target_ratio = median(width(target))/(extend + median(width(target)) + extend),
+                            smooth = FALSE, smooth_fun = slider_median) {
+  
+  path <- "../data/5_tracks"
+  matrices <- list()
+  
+  matrices$CHH <- normalise_samples(prefix = "", suffix = "_CHH_bins.bw", smooth = F, 
+                                    path = path, samples = samples, 
+                                    target = target, extend = extend, target_ratio = target_ratio)
+  
+  matrices$sRNA = list()
+  matrices$sRNA$nt21 <- normalise_to_matrix(signal = marks$sRNA_21, background = 0,
+                                          target = target, extend = extend, target_ratio = target_ratio)
+  matrices$sRNA$nt24 <- normalise_to_matrix(signal = marks$sRNA_24, background = 0,
+                                          target = target, extend = extend, target_ratio = target_ratio)
+  
+  return(matrices)
+}
+```
+
+```{r draw-function-and-parameters}
+draw_heatmaps <- function(matrices, y_lims = NULL, col_funs = NULL, axis_presences = NULL, split_col = c("#E41A1C","#377EB8"), 
+                          target = NULL, title = "", main_heatmap = NULL, split = NULL, legends = NULL, ht_gap_mm = 7) {
+  
+  hms = plot_heatmaps(matrices = matrices, axis_presences = axis_presences, split_col = split_col, show_heatmap_legend = is.null(legends), 
+                      col_funs = col_funs, y_lims = y_lims, replace_underscores = "\n")
+  
+  heatmap_list = hms$CHH$wt + hms$CHH$a4 + hms$CHH$a17 +
+                 hms$sRNA$nt21 + hms$sRNA$nt24
+  
+  # setting main heatmap (before adding split heatmap)
+  if(is.null(main_heatmap)) { main_heatmap = pluck(heatmap_list, attributes, "ht_list" , 1, attributes, "name")}
+  
+  if(!is.null(split)) {
+    heatmap_list = Heatmap(matrix = split, col = split_col, name = "  ", width = unit(3,"mm"), show_heatmap_legend = F, 
+                           border = F, use_raster = T, raster_device = "png", raster_quality = 10) + heatmap_list
+  }
+  
+  draw(heatmap_list, split = split, row_sub_title_side = "left",
+       ht_gap = unit(ht_gap_mm, "mm"), row_gap = unit(2, "mm"), 
+       column_title = gt_render(paste0("**",title, " (n=", nrow(matrices[[1]][[1]]), ")**")),
+       main_heatmap = main_heatmap, heatmap_legend_list = legends, heatmap_legend_side = "bottom")
+}
+
+# lists of parameters for the plotting
+y_lims = list(CHH = c(0,20), sRNA = c(0, 5))
+
+axis_presences = list(wt = FALSE, a4 = FALSE, nt21 = FALSE)
+
+col_funs = list(CHH      = brewer.ramp(0, 25, "YlGn"),
+               sRNA     = brewer.ramp(0, 15, "Blues"))
+  
+legends = packLegend(
+  Legend(col_fun = col_funs$CHH,       title = "% mCHH",  border=NA, direction = "horizontal", legend_width = unit(3, "cm")),
+  Legend(col_fun = col_funs$sRNA,      title = "sRNA multimappers",    border=NA, direction = "horizontal", legend_width = unit(3, "cm")),
+  direction = "horizontal", column_gap = unit(5, "mm")
+)
+```
+
+## DMRs CHH TET3 gain strong {.tabset}
+
+```{r}
+DMRs_CHH_TET3_gain_strong <- dmrs_list_gr$TET3$CHH$gain %>% 
+  filter(width > 50,
+         cytosinesCount > 10, 
+         abs(proportion2 - proportion1) > 0.5) 
+
+mats <- normalise_marks(target = DMRs_CHH_TET3_gain_strong, extend = 300)
+```
+
+### sort by CHH in WT
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong TET3 CHH DMRs gain", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "wt CHH",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-TET3-gain-strong_by-CHH-WT.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### sort by 24 nt sRNA
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong TET3 CHH DMRs gain", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt24 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-TET3-gain-strong_by-sRNA-24nt.pdf", width = 5, height = 5) %>% invisible()
+```
+
+
+## DMRs CHH TET3 loss strong {.tabset}
+
+```{r}
+DMRs_CHH_TET3_loss_strong <- dmrs_list_gr$TET3$CHH$loss %>% 
+  filter(width > 50,
+         cytosinesCount > 10, 
+         abs(proportion2 - proportion1) > 0.5) 
+
+mats <- normalise_marks(target = DMRs_CHH_TET3_loss_strong, extend = 300)
+```
+
+### sort by CHH in WT
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong TET3 CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "wt CHH",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-TET3-loss-strong_by-CHH-WT.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### sort by 24 nt sRNA
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong TET3 CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt24 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-TET3-loss-strong_by-sRNA-24nt.pdf", width = 5, height = 5) %>% invisible()
+```
+
+## DMRs CHH NTS gain strong {.tabset}
+
+```{r}
+DMRs_CHH_NTS_gain_strong <- dmrs_list_gr$NTS$CHH$gain %>% 
+  filter(width > 50,
+         cytosinesCount > 10, 
+         abs(proportion2 - proportion1) > 0.5) 
+
+mats <- normalise_marks(target = DMRs_CHH_NTS_gain_strong, extend = 300)
+```
+
+### sort by CHH in WT
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong NTS CHH DMRs gain", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "wt CHH",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-NTS-gain-strong_by-CHH-WT.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### sort by 24 nt sRNA
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong NTS CHH DMRs gain", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt24 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-NTS-gain-strong_by-sRNA-24nt.pdf", width = 5, height = 5) %>% invisible()
+```
+
+## DMRs CHH NTS loss strong {.tabset}
+
+```{r}
+DMRs_CHH_NTS_loss_strong <- dmrs_list_gr$NTS$CHH$loss %>% 
+  filter(width > 50,
+         cytosinesCount > 10, 
+         abs(proportion2 - proportion1) > 0.5) 
+
+mats <- normalise_marks(target = DMRs_CHH_NTS_loss_strong, extend = 300)
+```
+
+### sort by CHH in WT
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong A17 CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "wt CHH",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap-DMRs-CHH-NTS-loss-strong_by-CHH-WT.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### sort by 24 nt sRNA
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong A17 CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt24 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-NTS-loss-strong_by-sRNA-24nt.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### sort by 21 nt sRNA
+
+```{r, fig.height=5, fig.width=5}
+draw_heatmaps(matrices = mats, title = "Strong A17 CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt21 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-NTS-loss-strong_by-sRNA-21nt.pdf", width = 5, height = 5) %>% invisible()
+```
+
+### test full CHH bigwig
+
+```{r, fig.height=5, fig.width=5}
+mats$CHH$wt  <- normalise_to_matrix(signal = read_bigwig("../data/5_tracks/wt_CHH.bw"), target = DMRs_CHH_NTS_loss_strong, extend = 300)
+mats$CHH$a4  <- normalise_to_matrix(signal = read_bigwig("../data/5_tracks/a4_CHH.bw"), target = DMRs_CHH_NTS_loss_strong, extend = 300)
+mats$CHH$a17 <- normalise_to_matrix(signal = read_bigwig("../data/5_tracks/a17_CHH.bw"), target = DMRs_CHH_NTS_loss_strong, extend = 300)
+
+draw_heatmaps(matrices = mats, title = "Strong NTS CHH DMRs loss", ht_gap_mm = c(2,2,7,2), 
+              legends = legends, main_heatmap = "nt24 sRNA",
+              y_lims = y_lims, col_funs = col_funs, axis_presences = axis_presences)
+dev.copy2pdf(file = "../figures/enriched-heatmaps-2026/enriched-heatmap_DMRs-CHH-NTS-loss-strong_by-sRNA-24nt-full.pdf", width = 5, height = 5) %>% invisible()
+```
+
+

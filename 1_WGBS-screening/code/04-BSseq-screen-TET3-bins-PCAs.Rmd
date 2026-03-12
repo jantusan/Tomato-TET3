@@ -1,0 +1,939 @@
+---
+title: "PCAs of mC in 100 kbp bins"
+subtitle: "_Tomato TET3 BS-seq screening test_"
+author: "Javier Antúnez Sánchez"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_notebook: 
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+```
+
+------------------------------------------------------------------------
+
+Analysis of DNA methylation in 100 kbp bins created with `CX_report2mC_bins.v1.0.pl` from Bismark CX_reports.
+
+```{r libraries-and-functions, include=FALSE}
+# Libraries
+library(tidyverse)
+library(magrittr)
+library(cowplot); theme_set(theme_cowplot())
+library(ggforce)
+library(patchwork)
+```
+
+# Load data
+
+When loading data we filter chromosome 9 as there is an anomaly in the mapping (and extranuclear genomes), and samples A1_2, B2_13, neg, PBS & Undetermined, as they are the controls, the reads that couldn't be assigned to any library, and 2 samples with almost no reads
+
+```{r load-bins}
+bins_long_table <- read_tsv("../data/4_methylation/tomato_tet3_screening.mC_bins.100kbp.tsv", col_types = cols())  %>% 
+  # remove some ANSI carriage movement character
+  mutate(chr = str_remove_all(chr, "\\\033\\[K")) %>% 
+  # filter controls and samples with almost no reads
+  filter( ! sample %in% c("A1_2", "B2_13", "neg","PBS", "Undetermined")) %>% 
+  # order the samples as a factor
+  mutate(sample = factor(sample, levels = c(
+    "WT_1", "WT_2", "WT_3", "WT_4", "WT_6",
+    "A_1", "A_4", "A_12", "A_14", "A_15", "A_17", "A_21", "A_22",  
+    "A1_4", "A1_6", "A1_7", "A1_8", 
+    "A11_3", "A11_5", "A11_8", "A11_10", "A11_11", 
+    "B_2", "B_3", "B_4", "B_5", "B_6", "B_8", "B_10", "B_11", 
+    "B1_2", "B1_3", "B1_6", "B1_7", "B1_8", "B1_9",
+    "B2_1", "B2_5", "B2_9", "B2_10", "B2_14", "B2_16", "B2_18", "B2_20"
+  ))) %>% 
+  # remove ch09 with the anomaly and organelle genomes
+  filter(!(chr %in% c("SL4.0ch09", "Mt", "Pt")))
+```
+
+```{r pivot-bins}
+bins_wide_table <- bins_long_table %>% 
+  pivot_wider(chr:context, names_from = sample, values_from = mR, names_sort = TRUE)
+```
+
+```{r eval=FALSE}
+# Write matrix for future loading
+write_tsv(bins_wide_table, "../data/4_methylation/tomato_tet3_screening.mC_bins.100kbp.wide.tsv")
+```
+
+```{r eval=FALSE}
+# Read matrix
+bins_wide_table <- read_tsv("../data/4_methylation/tomato_tet3_screening.mC_bins.100kbp.wide.tsv", show_col_types = FALSE)
+```
+
+
+```{r aesthetic-variables}
+# Aesthetics to plot the PCA and other plots
+subline_colors <- c(A   = RColorBrewer::brewer.pal(8, "Reds")[4], 
+                    A1  = RColorBrewer::brewer.pal(8, "Reds")[6],
+                    A11 = RColorBrewer::brewer.pal(8, "Reds")[8], 
+                    B   = RColorBrewer::brewer.pal(8, "Blues")[4], 
+                    B1  = RColorBrewer::brewer.pal(8, "Blues")[6], 
+                    B2  = RColorBrewer::brewer.pal(8, "Blues")[8], 
+                    WT  = RColorBrewer::brewer.pal(8, "Greys")[8])
+
+line_shapes <- c(WT = 21, A = 23, B = 24)
+genotype_shapes <- c("TET3" = 24, "NT" = 21) 
+```
+
+```{r read-sample-table}
+sample_table <- read_csv("../data/tet3-bs-screen-sample-table.csv", col_types = cols()) %>% 
+  mutate(sample = fct_inorder(sample),
+         line = fct_inorder(line),
+         condition = fct_inorder(condition),
+         description = fct_inorder(description))
+```
+
+
+# PCAs 
+
+```{r}
+# General function for all DNA methylation data that takes table 
+#  (with format `chr`, `start`, `end`, `context`, [samples]) 
+#  and returns a table of Principal Components 
+pca_tidy_mC <- function(mC_table, context, ntop = 5000, sampletable = NULL) {
+  ctx <- context
+  # pick the top n observations by variance
+  top_obs <- mC_table %>%
+    filter(str_detect(context, ctx)) %>% # filter by context (including C for all)
+    rowwise(chr:context) %>% # calculate the variance for each observation
+    mutate(var = var(c_across(everything()))) %>%
+    ungroup() %>%
+    slice_max(var, n = ntop) %>% # pick only the top n
+    select(-var)
+  
+  # perform a PCA on the data
+  pca <- top_obs %>%
+    select( -(chr:context) ) %>% 
+    na.omit() %>% 
+    t() %>% 
+    prcomp()
+  
+  # convert it to a table
+  pca$x %>%
+    as_tibble(rownames = "sample") %>%
+    rename_with(~ pca$sdev^2 %>%        # square the sd to get the variance
+                  divide_by(sum(.)) %>% # divide it by the sum of variances
+                  multiply_by(100) %>%  # *100 to get a percentage of variance
+                  round() %>%           # round it
+                  str_c(.x, " [", ., "%]"), # paste it to the PCx 
+                .cols = -sample) %>% # exclude the sample column 
+    {
+      if (is.null(sampletable)) .
+      else left_join(., sampletable, by = "sample")
+    }
+}
+```
+
+```{r}
+# Function to make a matrix of PCA plots
+pca_matrix = function(pctable, pcs = 1:3, title = NULL) {
+  ggplot(pctable, aes(x = .panel_x, y = .panel_y)) + 
+    theme_cowplot() +
+    theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA), strip.background = element_blank(),
+          plot.title = element_text(hjust = 0.5)) +
+    scale_shape_manual(values = genotype_shapes) +
+    scale_fill_manual(values = subline_colors) +
+    guides(fill = guide_legend(override.aes = list(shape = 22)), 
+           shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+    #geom_mark_hull(aes(fill = condition), radius = 0.15, concavity = 1, expand = 0.1) +
+    geom_mark_ellipse(aes(fill = condition)) +
+    geom_autohistogram(aes(fill = condition), color="black", size = 0.6, alpha=0.7, show.legend = FALSE) +
+    geom_point(size=2, color="black", aes(fill = condition, shape = genotype)) +
+    facet_matrix(vars(pcs +1), layer.lower = c(1, 3), layer.upper = 3, layer.diag = 2) +
+    ggtitle(title)
+}
+```
+
+### CG PCA table {.tabset .tabset-pills}
+
+#### .
+
+#### show table
+
+```{r}
+pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table)
+```
+
+# Using the PCAs to remove ouliers {.tabset}
+
+We can identify outlier samples by looking at the PCAs, those samples that constitute one Principal Component on their own will probably be outliers. As this is a very lo coverage Whole Genome Bisulfite Sequencing, I suspect most of the variation that is not biological will come from the depth of sequencing, which varies between our samples, so I will use the number of Cytosines covered in the Mapping as a threshold to discard outliers. 
+
+## \> 1 Million Cs {.tabset .tabset-pills}
+
+We start with the samples with more than 1 Million Cytosines (meaning that we have already discarded before samples A1_2 & B2_13, which have almost no reads mapping, 34 and 8901 respectively)
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 1 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-1M-Cs.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+Most of the dispersion (except in CHH) is due to those samples with lowest coverage (B2_18 & B2_20) 
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+
+
+## \> 11 Million Cs {.tabset .tabset-pills}
+
+B_6 & B_11 have less than 11 M Cs
+
+```{r}
+bins_wide_table_11M_Cs <- bins_wide_table %>%
+  #select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14, B1_7, B2_16)) %>% 
+  select(-c(B2_18, B2_20, B_6, B_11))
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_11M_Cs, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_11M_Cs, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_11M_Cs, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_11M_Cs, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 11 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-11M-Cs.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_11M_Cs, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_11M_Cs, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_11M_Cs, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_11M_Cs, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+## \> 12 Million Cs {.tabset .tabset-pills}
+
+WT_6 & B_5 have less than 12 M Cs
+
+```{r}
+bins_wide_table_12M_Cs <- bins_wide_table %>%
+  #select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14, B1_7, B2_16)) %>% 
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5))
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_12M_Cs, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_12M_Cs, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_12M_Cs, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_12M_Cs, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 12 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-12M-Cs.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_12M_Cs, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_12M_Cs, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_12M_Cs, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_12M_Cs, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+## \> 13 Million Cs {.tabset .tabset-pills}
+
+A_1 have less than 13 M Cs
+
+```{r}
+bins_wide_table_13M_Cs <- bins_wide_table %>%
+  #select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14, B1_7, B2_16)) %>% 
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1))
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_13M_Cs, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_13M_Cs, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_13M_Cs, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_13M_Cs, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 13 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-13M-Cs.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_13M_Cs, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_13M_Cs, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_13M_Cs, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_13M_Cs, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+## \> 14 Million Cs {.tabset .tabset-pills .active}
+
+A_12, B1_2 & B2_14 have less than 14 M Cs
+
+```{r}
+bins_wide_table_14M_Cs <- bins_wide_table %>%
+  #select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14, B1_7, B2_16)) %>% 
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14))
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_14M_Cs, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_14M_Cs, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_14M_Cs, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_14M_Cs, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 14 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-14M-Cs-selected.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_14M_Cs, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_14M_Cs, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_14M_Cs, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_14M_Cs, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+## \> 15 Million Cs {.tabset .tabset-pills}
+
+B1_7 & B2_16 have less than 15 M Cs
+
+```{r}
+bins_wide_table_15M_Cs <- bins_wide_table %>%
+  select(-c(B2_18, B2_20, B_6, B_11, WT_6, B_5, A_1, A_12, B1_2, B2_14, B1_7, B2_16))
+```
+
+```{r, include=FALSE, fig.height=6, fig.width=16}
+pca_plot <- pca_tidy_mC(bins_wide_table_15M_Cs, "CG", sampletable = sample_table) %>% pca_matrix(title = "CG") +
+   pca_tidy_mC(bins_wide_table_15M_Cs, "CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG") +
+   pca_tidy_mC(bins_wide_table_15M_Cs, "CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH") +
+   pca_tidy_mC(bins_wide_table_15M_Cs, "C", sampletable = sample_table) %>% pca_matrix(title = "all Cs") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 15 Million Cytosines covered") +
+  plot_layout(guides = 'collect')
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-15M-Cs.pdf", plot = pca_plot, width = 12, height = 12)
+```
+
+After removing those last 2 samples there doesn't seem to be an improvement in the PCAs
+
+### mC
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_15M_Cs, "C", sampletable = sample_table) %>% 
+  pca_matrix(pcs = 1:4, title = "%mC")
+```
+
+### mCG {.active}
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_15M_Cs, "CG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCG")
+```
+
+### mCHG
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_15M_Cs, "CHG", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHG")
+```
+
+### mCHH
+
+```{r fig.height=10, fig.width=11}
+pca_tidy_mC(bins_wide_table_15M_Cs, "CHH", sampletable = sample_table) %>% 
+  pca_matrix(1:4, title = "%mCHH")
+```
+
+# Final set of samples
+
+Previously I had used the threshold of 15 Million Cs covered to discard some samples and make the PCAs of 100 kbp bins less noisy. After having another go at the PCAs I think it is better to use **14 Million Cs**. This way I keep more 2 more samples for the analysis and they don't seem to be outliers.
+
+```{r}
+bins_wide_table_filtered <- bins_wide_table_14M_Cs
+```
+
+### PCA CG context {.tabset}
+
+After filtering low coverage samples, PCA plots show interesting patterns for CG context:
+
+* PC1 (8%) separates WT from TET3 plants, with the first generation sublines being further away from the WTs, 
+* PC2 (5%) separates Line B from Line A and WT, and line A T1expands beyond WT range
+
+#### ellipses
+
+```{r fig.height=7, fig.width=9}
+pca_tidy_mC(bins_wide_table_filtered, "CG", sampletable = sample_table) %>% 
+  ggplot(aes(x = `PC1 [8%]`, y = `PC2 [5%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  coord_fixed() +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "PCA of %mCG for 100 kbp bins",
+       subtitle = "PC1 separates WT from TET3 lines based on %mC loss while PC2 separates TET3 lines A from B",
+       caption = "Percentage of variance explained by each PC in square brackets") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA))
+
+ggsave2(filename = "../figures/mC_bins/PCA-100kb-CG-PC12-ellipse.pdf", width = 9, height = 7)
+```
+
+#### hulls
+
+```{r fig.height=7, fig.width=9}
+pca_tidy_mC(bins_wide_table_filtered, "CG", sampletable = sample_table) %>% 
+  ggplot(aes(x = `PC1 [8%]`, y = `PC2 [5%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_hull(aes(fill = condition, label = description), radius = unit(5, "mm"), 
+                concavity = 9, con.cap = 0, label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  coord_fixed() +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "PCA of %mCG for 100 kbp bins",
+       subtitle = "PC1 separates WT from TET3 lines based on %mC loss while PC2 separates TET3 lines A from B",
+       caption = "Percentage of variance explained by each PC in square brackets") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA))
+
+ggsave2(filename = "../figures/mC_bins/PCA-100kb-CG-PC12-hull.pdf", width = 9, height = 7)
+```
+
+# Correlation between PC1 and %mC {.tabset .tabset-pills}
+  
+From the PCAs there seems to be a correlation between CG methylation loss and position across the PC1. To check if it is true I compared the average methylation across the genome (mean of all 100 kbp bins) to the position across PC1 and calculate the correlation using a linear model. The Pearson correlation coeficient is 0.99, so PC1 is reflecting global CG methylation levels. I tried this for the other context and the correation is also perfect, even in CHH, which has a lot of varince captured in PC1 (37%) but that doesn't separete the samples by group.
+
+## CG
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table_filtered, "CG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [8%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 81.2, label.x = -200, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 80.9, label.x = -200, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Relation between global %mCG and PC1 for 100 kbp bins", y = "global %mCG",
+       subtitle = "There is a strong correlation between PC1 and %mCG",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA))
+ggsave2(filename = "../figures/mC_bins/PCA-100kb-CG-PC1-mCG-correlation.pdf", width = 7, height = 5)
+```
+
+## CHG
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table_filtered, "CHG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [9%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 57.9, label.x = -330, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 57.6, label.x = -330, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Relation between global %mCHG and PC1 for 100 kbp bins", y = "global %mCHG",
+       subtitle = "There is a strong correlation between PC1 and %mCHG",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA))
+```
+
+## CHH
+
+```{r fig.height=5, fig.width=7}
+pca_tidy_mC(bins_wide_table_filtered, "CHH", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [37%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHH") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 9.5, label.x = -150, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 9.3, label.x = -150, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Relation between global %mCHH and PC1 for 100 kbp bins", y = "global %mCHH",
+       subtitle = "There is a strong correlation between PC1 and %mCHH",) +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA))
+```
+
+# PCAs split by chromatin
+
+Now I would like to check if the patterns hold equally for Heterochromatin and Euchromatin
+
+Using information about location of boundaries between euchromatin and heterochromatin inferred from H3K27mac ChIP-seq data, we can compare the changes in DNA methylation between the two compartments of the genome.
+
+```{r fig.width=11, fig.height=10}
+hchrom_H3K27ac_100kbp_bins <- read_tsv("/path/to/genome/SL4.0_heterochromatin_100kbp_bins_H3K27ac_chXX.tsv", show_col_types = FALSE) %>% 
+  mutate(seqnames = str_c("SL4.0", seqnames),
+         start = start - 1) %>% 
+  dplyr::rename(chr = seqnames)
+
+filter_chromatin <- function(table, filter) {
+  table %>% 
+    left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+    filter(chromatin == filter) %>% 
+    select(-chromatin)
+}
+```
+
+```{r, include=FALSE}
+pca_plot <- bins_wide_table_filtered %>% filter_chromatin("Heterochromatin") %>% pca_tidy_mC("CG", sampletable = sample_table) %>% pca_matrix(title = "CG Heterochromatin") +
+   bins_wide_table_filtered %>% filter_chromatin("Euchromatin") %>% pca_tidy_mC("CG", sampletable = sample_table) %>% pca_matrix(title = "CG Euchromatin") +
+   bins_wide_table_filtered %>% filter_chromatin("Heterochromatin") %>% pca_tidy_mC("CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG Heterochromatin") +
+   bins_wide_table_filtered %>% filter_chromatin("Euchromatin") %>% pca_tidy_mC("CHG", sampletable = sample_table) %>% pca_matrix(title = "CHG Euchromatin") +
+   bins_wide_table_filtered %>% filter_chromatin("Heterochromatin") %>% pca_tidy_mC("CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH Heterochromatin") +
+   bins_wide_table_filtered %>% filter_chromatin("Euchromatin") %>% pca_tidy_mC("CHH", sampletable = sample_table) %>% pca_matrix(title = "CHH Euchromatin") +
+   plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins split by chromatin",
+                   subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 14 Million Cytosines covered") +
+  plot_layout(guides = 'collect', ncol = 2)
+
+ggsave(filename = "../figures/mC_bins/PCA-100kb-matrices-chromatin.pdf", plot = pca_plot, width = 14, height = 21)
+```
+
+For CG context, which had the clearest separation of samples before splitting for chromatin, the pattern is lost for the Euchromatin bins, with the PCs not clustering samples, while for Heterochromatin the pattern is maintained.
+
+```{r fig.width=15, fig.height=8}
+bins_wide_table_filtered %>% filter_chromatin("Heterochromatin") %>% pca_tidy_mC("CG", sampletable = sample_table) %>% pca_matrix(title = "CG Heterochromatin") +
+  bins_wide_table_filtered %>% filter_chromatin("Euchromatin") %>% pca_tidy_mC("CG", sampletable = sample_table) %>% pca_matrix(title = "CG Euchromatin") +
+  plot_annotation(title = "Matrix of PCs of %mC for 100 kbp bins split by chromatin",
+                  subtitle = "Percentage of variance explained by each PC in square brackets",
+                   caption = "Only samples with more than 14 Million Cytosines covered") +
+  plot_layout(guides = 'collect', ncol = 2)
+```
+
+### PCA CG context in Heterochromatin {.tabset}
+
+CG context PC1 accounts for 18% of the variance in Heterocrhomatin, instead of 8% for the whole genome. This suggests that most of the methylation differences (that explain PC1) are concentrated in heterochromatic regions of the genome.
+
+#### ellipses
+
+```{r fig.height=7, fig.width=9}
+bins_wide_table_filtered %>% 
+  filter_chromatin("Heterochromatin") %>% 
+  pca_tidy_mC("CG", sampletable = sample_table) %>% 
+  ggplot(aes(x = `PC1 [18%]`, y = `PC2 [5%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  coord_fixed() +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "PCA of %mCG for 100 kbp Heterochromatic bins",
+       subtitle = "PC1 separates WT from TET3 lines based on %mC loss while PC2 separates TET3 lines A from B",
+       caption = "Percentage of variance explained by each PC in square brackets") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        legend.position = "bottom")
+```
+
+#### hulls
+
+```{r fig.height=7, fig.width=9}
+bins_wide_table_filtered %>% 
+  filter_chromatin("Heterochromatin") %>% 
+  pca_tidy_mC("CG", sampletable = sample_table) %>% 
+  ggplot(aes(x = `PC1 [18%]`, y = `PC2 [5%]`)) + 
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_hull(aes(fill = condition, label = description), radius = unit(5, "mm"), 
+                concavity = 9, con.cap = 0, label.fill = "grey95") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  coord_fixed() +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "PCA of %mCG for 100 kbp Heterochromatic bins",
+       subtitle = "PC1 separates WT from TET3 lines based on %mC loss while PC2 separates TET3 lines A from B",
+       caption = "Percentage of variance explained by each PC in square brackets") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        legend.position = "bottom")
+```
+
+### Correlation between PC1 and %mC by chromatin {.tabset .tabset-pills}
+  
+After spliting Euchromatin bins from Heterochromatin bins the correlation between PC1 and %mCG is only visible for the heterochromatin. For euchromatin there seems to be no connection (I checked other PCs up unitl PC5 and none of them reflect the %mC), even though the samples clearly separate by methylation level.
+
+For CHG and CHH the correlation is much stronger in Heterochromatin, but it is still apparent for Euchromatin
+
+#### CG 
+
+```{r fig.height=5, fig.width=10}
+(bins_wide_table_filtered %>% 
+  filter_chromatin("Heterochromatin") %>% 
+  pca_tidy_mC("CG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [18%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 85.2, label.x = -200, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 84.9, label.x = -200, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Heterochromatin", y = "Heterochromatic %mCG") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  
+  (bins_wide_table_filtered %>% 
+  filter_chromatin("Euchromatin") %>% 
+  pca_tidy_mC("CG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [5%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 81.0, label.x = -230, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 80.7, label.x = -230, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Euchromatin", y = "Euchromatic %mCG") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) + 
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  plot_annotation(title = "Relation between global %mCG and PC1 for 100 kbp bins",
+                  subtitle = "The correlation between PC1 and %mCG only stands in Heterochromatin") +
+  plot_layout(guides = 'collect', ncol = 2)
+```
+
+#### CHG 
+
+```{r fig.height=5, fig.width=10}
+(bins_wide_table_filtered %>% 
+  filter_chromatin("Heterochromatin") %>% 
+  pca_tidy_mC("CHG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [11%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 54.4, label.x = -210, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 54.1, label.x = -210, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Heterochromatin", y = "Heterochromatic %mCHG") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  
+  (bins_wide_table_filtered %>% 
+  filter_chromatin("Euchromatin") %>% 
+  pca_tidy_mC("CHG", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [6%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHG") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 58.2, label.x = -140, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 57.9, label.x = -140, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Euchromatin", y = "Euchromatic %mCHG") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) + 
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  plot_annotation(title = "Relation between global %mCHG and PC1 for 100 kbp bins",
+                  subtitle = "The correlation between PC1 and %mCHG is stronger in Heterochromatin") +
+  plot_layout(guides = 'collect', ncol = 2)
+```
+
+#### CHH
+
+```{r fig.height=5, fig.width=10}
+(bins_wide_table_filtered %>% 
+  filter_chromatin("Heterochromatin") %>% 
+  pca_tidy_mC("CHH", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [48%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHH") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 9.6, label.x = -170, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 9.43, label.x = -170, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Heterochromatin", y = "Heterochromatic %mCHH") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  
+  (bins_wide_table_filtered %>% 
+  filter_chromatin("Euchromatin") %>% 
+  pca_tidy_mC("CHH", sampletable = sample_table) %>% 
+  select(sample, PC1 = `PC1 [10%]`, condition, description, genotype) %>% 
+  left_join(bins_long_table %>% 
+              filter(context == "CHH") %>% 
+              group_by(sample) %>% 
+              summarise(mean_mR = mean(mR)),
+            by = "sample") %>% 
+  ggplot(aes(x = PC1, y = mean_mR)) + 
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_mark_ellipse(aes(fill = condition, label = description), con.cap = 0, label.fill = "grey95") +
+  geom_smooth(method = "lm", se=FALSE, formula = y ~ x, size = 3, alpha = 0.1, color = "darkorchid1") +
+  geom_point(size=3, color="black", aes(fill = condition, shape = genotype)) +
+  ggpubr::stat_regline_equation(label.y = 6.9, label.x = 5, color = "darkorchid3") +
+  ggpubr::stat_cor(label.y = 6.75, label.x = 5, color = "darkorchid3") +
+  scale_shape_manual(values = genotype_shapes) +
+  scale_fill_manual("Line", values = subline_colors) +
+  labs(title = "Euchromatin", y = "Euchromatic %mCHH") +
+  guides(fill = guide_legend(override.aes = list(shape = 22, color = NA)), 
+         shape = guide_legend(override.aes = list(fill = "darkseagreen2", size = 3))) + 
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        plot.title = element_text(hjust = 0.5))) +
+  plot_annotation(title = "Relation between global %mCHH and PC1 for 100 kbp bins",
+                  subtitle = "The correlation between PC1 and %mCHH is stronger in Heterochromatin") +
+  plot_layout(guides = 'collect', ncol = 2)
+```
+
+## variance by chromatin
+
+Check how many of the 5000 windows with the most variation are hetero vs euchromatic
+
+```{r}
+bins_wide_table_filtered %>%
+  filter(str_detect(context, "CG")) %>% # filter by context (including C for all)
+  rowwise(chr:context) %>% # calculate the variance for each observation
+  mutate(var = var(c_across(everything()))) %>%
+  ungroup() %>%
+  slice_max(var, n = 5000) %>% 
+  left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+  filter(!is.na(chromatin)) %>%
+  count(chromatin) %>% 
+  mutate(percent = n / sum(n),
+         total = sum(n))
+```
+Versus the whole set of bins
+
+```{r}
+hchrom_H3K27ac_100kbp_bins %>% 
+  count(chromatin) %>% 
+  mutate(percent = n / sum(n),
+         total = sum(n))
+```
+
+In the 5000 more variable there is an enrichment in Euchromatin, even though in eucrhomatin there is no pattern.
+
+To check the distribution better I did a raincloud plot , the there seems to be significantly more variation in methylation rates in the Euchromatin, but the bins that are the most variable are Heterochromatic.
+
+I'm not entirely sure if this last bit is of any use, but I managed to get a nice plot.
+
+```{r raincloud-plot, fig.width=9, fig.height=4}
+bins_wide_table_filtered %>%
+  filter(str_detect(context, "CG")) %>% # filter by context (including C for all)
+  rowwise(chr:context) %>% # calculate the variance for each observation
+  mutate(var = var(c_across(everything()))) %>%
+  ungroup() %>%
+  left_join(hchrom_H3K27ac_100kbp_bins, by = c("chr", "start", "end")) %>% 
+  filter(!is.na(chromatin)) %>% 
+  ggplot(aes(y = var, x = chromatin, fill = chromatin)) + 
+  ggdist::stat_halfeye(adjust = .5, width = .6, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .15, outlier.shape = NA, color = 1) +
+  gghalves::geom_half_point(side = "l", shape = 16, size = 0.5, alpha = 0.3, range_scale = .4) +
+  scale_fill_brewer(palette = "Set1") +
+  coord_flip() +
+  scale_y_continuous(trans = "pseudo_log", breaks = c(1, 2, 5, 10, 20, 50, 100, 200, 500, 800)) +
+  labs(title = "Variance between samples in %mCG for 100 kbp bins", y = "Variance in methylation between samples (Pseudo-log)",
+       subtitle = "Heterochromatin bins are less variable than Eucrhomatin ones,\nathough the most variable bins are Heterochromatic (not shown)") +
+  theme(axis.line=element_blank(), panel.border = element_rect(colour="black", size=1, fill=NA),
+        legend.position = "none", axis.title.y = element_blank())
+```
+
