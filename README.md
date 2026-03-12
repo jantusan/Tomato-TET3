@@ -6,6 +6,10 @@ Analysis repository for Antunez-Sanchez et al., containing traceable code and re
 
 Antunez-Sanchez J, Engelhorn J, Lopez-Gomollon S, Meyer P, Gutierrez-Marcos J. Enzymatic DNA demethylation enables the formation of stable epimutations in tomato. Journal of Experimental Botany. Published 10 March 2026. https://doi.org/10.1093/jxb/erag132
 
+## Graphical abstract
+
+![Graphical abstract](Graphical-abstract.png)
+
 ## Repository layout
 
 - `1_WGBS-screening/`: Screening-level WGBS analyses (code, rendered reports, processed data)
