@@ -25,6 +25,7 @@ Each analysis directory is structured as:
 ## Data availability
 
 - GEO accession: **GSE303457**
+- Public GEO record: [https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE303457](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE303457)
 
 ## Software requirements
 
